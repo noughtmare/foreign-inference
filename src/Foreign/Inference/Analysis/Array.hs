@@ -57,6 +57,9 @@ $(makeLenses ''ArraySummary)
 instance Eq ArraySummary where
   (ArraySummary s1 _) == (ArraySummary s2 _) = s1 == s2
 
+instance Semigroup ArraySummary where
+  (<>) = mappend
+
 instance Monoid ArraySummary where
   mempty = ArraySummary M.empty mempty
   mappend (ArraySummary s1 d1) (ArraySummary s2 d2) =
@@ -87,7 +90,7 @@ data PointerUse = IndexOperation Value [Value]
                 | CallArgument Int
                 deriving (Show)
 
-identifyArrays :: (FuncLike funcLike, HasFunction funcLike)
+identifyArrays :: (FuncLike funcLike, HasDefine funcLike)
                   => DependencySummary
                   -> Lens' compositeSummary ArraySummary
                   -> ComposableAnalysis compositeSummary funcLike
@@ -100,7 +103,7 @@ identifyArrays ds =
 -- Function to the current summary.  This function collects all of the
 -- base+offset pairs and then uses @traceFromBases@ to reconstruct
 -- them.
-arrayAnalysis :: (FuncLike funcLike, HasFunction funcLike)
+arrayAnalysis :: (FuncLike funcLike, HasDefine funcLike)
                  => funcLike -> ArraySummary -> Analysis ArraySummary
 arrayAnalysis funcLike a@(ArraySummary summary _) = do
   basesAndOffsets <- mapM (isArrayDeref a) insts
@@ -109,8 +112,8 @@ arrayAnalysis funcLike a@(ArraySummary summary _) = do
       summary' = M.foldlWithKey' (traceFromBases baseResultMap) summary baseResultMap
   return $! (arraySummary .~ summary') a
   where
-    f = getFunction funcLike
-    insts = concatMap basicBlockInstructions (functionBody f)
+    f = getDefine funcLike
+    insts = concatMap bbStmts (defBody f)
     addDeref (base, use) = M.insertWith (++) base [use]
 
 -- | Examine a GetElementPtr instruction result.  If the base is an
@@ -127,8 +130,8 @@ traceFromBases :: HashMap Value [PointerUse]
 traceFromBases baseResultMap summary base uses =
   -- FIXME: This test of argumentness needs to be extended to take
   -- into account PHI nodes (also selects)
-  case valueContent' base of
-    ArgumentC a ->
+  case valValue (valueContent' base) of
+    ValIdent (IdentValArgument a) ->
       let depth = maximum $ map dispatchTrace uses
       in addToSummary depth a summary
     _ -> summary
@@ -162,35 +165,23 @@ traceBackwards baseResultMap result depth =
         CallArgument d -> depth + d
 
 isArrayDeref :: ArraySummary
-                -> Instruction
+                -> Stmt
                 -> Analysis [(Value, PointerUse)]
 isArrayDeref summ inst =
   case valueContent' inst of
-    InstructionC LoadInst { loadAddress = (valueContent ->
-       InstructionC GetElementPtrInst { getElementPtrValue = base
-                                     , getElementPtrIndices = idxs
-                                     })} ->
+    ValInstr (Load (ValInstr (GEP _ base idxs)) _ _) ->
       return $ handleGEP idxs base
-    InstructionC StoreInst { storeAddress = (valueContent ->
-       InstructionC GetElementPtrInst { getElementPtrValue = base
-                                      , getElementPtrIndices = idxs
-                                      })} ->
+    ValInstr (Store (ValInstr (GEP _ base idxs)) _ _ _) ->
       return $ handleGEP idxs base
-    InstructionC AtomicCmpXchgInst { atomicCmpXchgPointer = (valueContent ->
-      InstructionC GetElementPtrInst { getElementPtrValue = base
-                                      , getElementPtrIndices = idxs
-                                      })} ->
+    ValInstr (CmpXchg _ _ (ValInstr (GEP _ base idxs)) _ _ _ _ _) ->
       return $ handleGEP idxs base
-    InstructionC AtomicRMWInst { atomicRMWPointer = (valueContent ->
-      InstructionC GetElementPtrInst { getElementPtrValue = base
-                                      , getElementPtrIndices = idxs
-                                      })} ->
+    ValInstr (AtomicRW _ _ (ValInstr (GEP _ base idxs)) _ _ _) ->
       return $ handleGEP idxs base
-    InstructionC CallInst { callFunction = f, callArguments = args } ->
-      let indexedArgs = zip [0..] (map fst args)
+    ValInstr (Call _ _ f args) ->
+      let indexedArgs = zip [0..] args
       in foldM (collectArrayArgs summ f) [] (concatMap expand indexedArgs)
-    InstructionC InvokeInst { invokeFunction = f, invokeArguments = args } ->
-      let indexedArgs = zip [0..] (map fst args)
+    ValInstr (Invoke _ f args _ _) ->
+      let indexedArgs = zip [0..] args
       in foldM (collectArrayArgs summ f) [] (concatMap expand indexedArgs)
     _ -> return []
   where
@@ -199,12 +190,12 @@ isArrayDeref summ inst =
       let flatVals = flattenValue base
       in foldl' (buildArrayDeref inst idxs) [] flatVals
 
-buildArrayDeref :: Instruction -> [Value] -> [(Value, PointerUse)] -> Value -> [(Value, PointerUse)]
+buildArrayDeref :: Stmt -> [Value] -> [(Value, PointerUse)] -> Value -> [(Value, PointerUse)]
 buildArrayDeref inst idxs acc base =
   case idxs of
     [] -> error ("Foreign.Inference.Analysis.buildArrayDeref: GEP with no indices: " ++ show inst)
     [_] -> (base, IndexOperation (toValue inst) idxs) : acc
-    (valueContent' -> ConstantC ConstantInt { constantIntValue = 0 }) : _ -> acc
+    (valValue . valueContent' -> ValInteger 0) : _ -> acc
     _ -> (base, IndexOperation (toValue inst) idxs ) : acc
 
 -- | If the argument is an array (according to either the module
@@ -239,5 +230,5 @@ arraySummaryToTestFormat (ArraySummary summ _) =
   Map.fromList $ map (first argToString) $ M.toList summ
   where
     argToString a =
-      let f = argumentFunction a
-      in (show (functionName f), show (argumentName a))
+      let f = argDefine a
+      in (prettySymbol (defName f), argName a)

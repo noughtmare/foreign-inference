@@ -27,6 +27,7 @@ import qualified Data.HashMap.Strict as HM
 import Data.List ( mapAccumR )
 import Data.Map ( Map )
 import qualified Data.Map as M
+import qualified Data.Map.Strict as MS
 import Data.Maybe ( fromMaybe, isNothing, mapMaybe )
 import Data.Set ( Set )
 import qualified Data.Set as S
@@ -56,7 +57,7 @@ data EscapeClass = DirectEscape
                  | BrokenContractEscape
                  | IndirectEscape
                  | ArgumentEscape !Int -- ^ Index escaped into
-                 deriving (Eq, Ord, Read, Show)
+                 deriving (Eq, Ord, Read, Show, Generic)
 
 instance Hashable EscapeClass where
   hashWithSalt s DirectEscape = s `hashWithSalt` (76 :: Int)
@@ -67,23 +68,27 @@ instance Hashable EscapeClass where
 
 instance NFData EscapeClass
 
-data ArgumentDescriptor = ArgumentDescriptor Function Int
+data ArgumentDescriptor = ArgumentDescriptor Define Int
                         deriving (Eq, Ord, Show, Generic)
 
 instance NFData ArgumentDescriptor where
   rnf = genericRnf
 
 data Constructor = Sink { sinkClass :: EscapeClass
-                        , sinkWitness :: Instruction
+                        , sinkWitness :: Stmt
                         , sinkIntoArgument :: Maybe ArgumentDescriptor
                         }
                  deriving (Eq, Ord, Show, Generic)
+
+instance NFData Constructor
 
 data Var = Location !Value
          | FieldSource { fieldSourceArgument :: !Argument
                        , fieldSourcePath :: AbstractAccessPath
                        }
          deriving (Eq, Ord, Show, Generic)
+
+instance NFData Var
 
 type SetExp = SetExpression Var Constructor
 type ValueFlowGraph = SolvedSystem Var Constructor
@@ -93,16 +98,18 @@ data EscapeGraph = EscapeGraph {
   escapeVFG :: ValueFlowGraph
   } deriving (Eq, Generic)
 
-instance NFData EscapeGraph
+-- TODO fix this in ifscs
+instance NFData EscapeGraph where
+  rnf x = x `seq` ()
 
 -- | The monad in which we construct the value flow graph
 -- type GraphBuilder = State GraphState
 
 data EscapeSummary =
-  EscapeSummary { _escapeGraph :: HashMap Function EscapeGraph
-                , _escapeArguments :: HashMap Argument (EscapeClass, Instruction)
-                , _escapeFields :: HashMap Argument (Set (EscapeClass, AbstractAccessPath, Instruction))
-                , _escapeIntoArguments :: HashMap Argument (EscapeClass, Function, Int)
+  EscapeSummary { _escapeGraph :: HashMap Define EscapeGraph
+                , _escapeArguments :: HashMap Argument (EscapeClass, Stmt)
+                , _escapeFields :: HashMap Argument (Set (EscapeClass, AbstractAccessPath, Stmt))
+                , _escapeIntoArguments :: HashMap Argument (EscapeClass, Define, Int)
                 , _escapeDiagnostics :: Diagnostics
                 }
   deriving (Generic)
@@ -118,6 +125,9 @@ instance Eq EscapeSummary where
 
 emptySummary :: EscapeSummary
 emptySummary = EscapeSummary mempty mempty mempty mempty mempty
+
+instance Semigroup EscapeSummary where
+  (<>) = mappend
 
 instance Monoid EscapeSummary where
   mempty = emptySummary
@@ -146,7 +156,7 @@ type Analysis = AnalysisMonad () ()
 -- (incorporating information from other functions that have already
 -- been analyzed) and then checks to see which arguments escape using
 -- that graph.
-identifyEscapes :: (FuncLike funcLike, HasFunction funcLike)
+identifyEscapes :: (FuncLike funcLike, HasDefine funcLike)
                    => DependencySummary
                    -> IndirectCallSummary
                    -> Lens' compositeSummary EscapeSummary
@@ -156,9 +166,9 @@ identifyEscapes ds ics lns =
   where
     runner a = runAnalysis a ds () ()
     escapeWrapper funcLike s = do
-      let f = getFunction funcLike
-      g <- buildValueFlowGraph ics s (functionInstructions f)
-      let s' = foldr (summarizeArgumentEscapes g) s (functionParameters f)
+      let f = getDefine funcLike
+      g <- buildValueFlowGraph ics s (defStmts f)
+      let s' = foldr (summarizeArgumentEscapes g) s (defArgs f)
       return $ (escapeGraph %~ HM.insert f g) s'
 
 {-
@@ -183,26 +193,26 @@ identifyEscapes ds ics lns =
 -- an out parameter) and to determine if they also escape via some
 -- other means.  In that case, the @ignore@ predicate should return
 -- True for the store instruction that created the known escape.
-instructionEscapesWith :: (Instruction -> Bool)
-                          -> Instruction
+instructionEscapesWith :: (Stmt -> Bool)
+                          -> Stmt
                           -> EscapeSummary
-                          -> Maybe Instruction
+                          -> Maybe Stmt
 instructionEscapesWith = instructionEscapeCore
 
 -- | Returns the instruction (if any) that causes the input
 -- instruction to escape.  This does *not* cover WillEscape at all.
-instructionEscapes :: Instruction -> EscapeSummary -> Maybe Instruction
+instructionEscapes :: Stmt -> EscapeSummary -> Maybe Stmt
 instructionEscapes = instructionEscapeCore (const False)
 
 -- | This is shared code for all of the instruction escape queries.
 --
 -- Most of the description is on 'instructionEscapesWith'
-instructionEscapeCore :: (Instruction -> Bool)
-                         -> Instruction
+instructionEscapeCore :: (Stmt -> Bool)
+                         -> Stmt
                          -> EscapeSummary
-                         -> Maybe Instruction
+                         -> Maybe Stmt
 instructionEscapeCore ignorePred i (EscapeSummary egs _ _ _ _) = do
-  f <- instructionFunction i
+  let f = bbDefine (stmtBasicBlock i)
   EscapeGraph _ eg <- HM.lookup f egs
   ts@(_:_) <- leastSolution eg (Location (toValue i))
   let sinks = map toSink ts
@@ -217,10 +227,11 @@ summarizeEscapeArgument a er
   | otherwise =
     case HM.lookup a (er ^. escapeArguments) of
       Nothing -> []
-      Just (DirectEscape, w@RetInst {}) -> [(PAWillEscape, [Witness w "ret"])]
-      Just (t, w@StoreInst {}) -> [(tagToAnnot t, [Witness w "store"])]
-      Just (t, w@CallInst {}) -> [(tagToAnnot t, [Witness w "call"])]
-      Just (t, w@InvokeInst {}) -> [(tagToAnnot t, [Witness w "call"])]
+      Just (DirectEscape, w@(stmtInstr -> Ret {})) -> [(PAWillEscape, [Witness w "ret"])]
+      Just (DirectEscape, w@(stmtInstr -> RetVoid {})) -> [(PAWillEscape, [Witness w "ret"])]
+      Just (t, w@(stmtInstr -> Store {})) -> [(tagToAnnot t, [Witness w "store"])]
+      Just (t, w@(stmtInstr -> Call {})) -> [(tagToAnnot t, [Witness w "call"])]
+      Just (t, w@(stmtInstr -> Invoke {})) -> [(tagToAnnot t, [Witness w "call"])]
       Just (t, w) -> [(tagToAnnot t, [Witness w "access"])]
   where
     tagToAnnot t =
@@ -266,13 +277,13 @@ argumentFieldsEscape (EscapeGraph fields eg) a s = do
 
 notPointer :: IsValue v => v -> Bool
 notPointer v =
-  case valueType v of
-    TypePointer _ _ -> False
+  case valType (toValue v) of
+    (PtrTo _) -> False
     _ -> True
 
 buildValueFlowGraph :: IndirectCallSummary
                        -> EscapeSummary
-                       -> [Instruction]
+                       -> [Stmt]
                        -> Analysis EscapeGraph
 buildValueFlowGraph ics summ is = do
   (inclusionSystem, fieldSrcs) <- foldM addInclusion ([], mempty) is
@@ -283,23 +294,23 @@ buildValueFlowGraph ics summ is = do
   where
     sinkExp klass witness argDesc = atom (Sink klass witness argDesc)
     setExpFor v =
-      case valueContent' v of
-        InstructionC i@GetElementPtrInst { } ->
+      case valValue (valueContent' v) of
+        ValIdent (IdentValStmt i@(stmtInstr -> GEP {})) ->
           case argumentBasedField i of
             Nothing -> setVariable (Location (stripBitcasts v))
             Just (a, aap) -> setVariable (FieldSource a aap)
-        InstructionC i@LoadInst { } ->
+        ValIdent (IdentValStmt i@(stmtInstr -> Load {})) ->
           case argumentBasedField i of
             Nothing -> setVariable (Location (stripBitcasts v))
             Just (a, aap) -> setVariable (FieldSource a aap)
         _ -> setVariable (Location (stripBitcasts v))
 
     addInclusion :: ([Inclusion Var Constructor], HashMap Argument [AbstractAccessPath])
-                    -> Instruction
+                    -> Stmt
                     -> Analysis ([Inclusion Var Constructor], HashMap Argument [AbstractAccessPath])
     addInclusion acc@(incs, fsrcs) i =
-      case i of
-        RetInst { retInstValue = Just (valueContent' -> rv) } ->
+      case stmtInstr i of
+        Ret (valueContent' -> rv) ->
           let s = sinkExp DirectEscape i Nothing
               c = s <=! setExpFor rv
           in return (c : incs, fsrcs)
@@ -307,21 +318,19 @@ buildValueFlowGraph ics summ is = do
         -- into a FieldSource and see what happens to it later.
         -- Record the argument/access path in a map somewhere for
         -- later lookup (otherwise we can't find the variable)
-        GetElementPtrInst {} ->
+        GEP {} ->
           case argumentBasedField i of
             Just (a, aap) ->
               let c = setExpFor (toValue i) <=! setVariable (FieldSource a aap)
                   srcs' = HM.insertWith (++) a [aap] fsrcs
               in return (c : incs, srcs')
             Nothing -> return acc
-        LoadInst { loadAddress = la }
+        Load la _ _
           | notPointer i || isNothing (argumentBasedField i) -> return acc
           | otherwise ->
             let c = setExpFor (toValue i) <=! setExpFor la
             in return (c : incs, fsrcs)
-        StoreInst { storeAddress = sa
-                  , storeValue = sv
-                  }
+        Store sa sv _ _
           | mustEsc ->
             let sinkTag = maybe DirectEscape (ArgumentEscape . argumentIndex) mArg
                 s = sinkExp sinkTag i Nothing
@@ -334,34 +343,32 @@ buildValueFlowGraph ics summ is = do
           where
             (mustEsc, mArg) = mustEscapeLocation sa
 
-        CallInst { callFunction = callee, callArguments = (map (stripBitcasts . fst) -> args) } ->
+        Call _ _ callee (map stripBitcasts -> args) ->
           addCallConstraints i acc callee args
-        InvokeInst { invokeFunction = callee, invokeArguments = (map (stripBitcasts . fst) -> args) } ->
+        Invoke _ callee (map stripBitcasts -> args) _ _ ->
           addCallConstraints i acc callee args
-        SelectInst { selectTrueValue = (valueContent' -> tv)
-                   , selectFalseValue = (valueContent' -> fv)
-                   } ->
+        Select _ (valueContent' -> tv) (valueContent' -> fv) ->
           let c1 = setExpFor (toValue i) <=! setExpFor tv
               c2 = setExpFor (toValue i) <=! setExpFor fv
           in return (c1 : c2 : incs, fsrcs)
-        PhiNode { phiIncomingValues = (map (stripBitcasts . fst) -> ivs) } ->
+        Phi _ (map (stripBitcasts . fst) -> ivs) ->
           let toIncl v = setExpFor (toValue i) <=! setExpFor v
               cs = map toIncl ivs
           in return (cs ++ incs, fsrcs)
         _ -> return acc
 
-    addCallConstraints :: Instruction
+    addCallConstraints :: Stmt
                           -> ([Inclusion Var Constructor], HashMap Argument [AbstractAccessPath])
                           -> Value
                           -> [Value]
                           -> Analysis ([Inclusion Var Constructor], HashMap Argument [AbstractAccessPath])
     addCallConstraints callInst (incs, fsrcs) callee args =
-      case valueContent' callee of
-        FunctionC f -> do
+      case valValue (valueContent' callee) of
+        (ValSymbol (SymValDefine f)) -> do
           let indexedArgs = zip [0..] args
           incs' <- foldM (addActualConstraint callInst f) incs indexedArgs
           return (incs', fsrcs)
-        ExternalFunctionC ef -> do
+        (ValSymbol (SymValDeclare ef)) -> do
           let indexedArgs = zip [0..] args
           incs' <- foldM (addActualConstraint callInst ef) incs indexedArgs
           return (incs', fsrcs)
@@ -383,7 +390,7 @@ buildValueFlowGraph ics summ is = do
           c = s <=! setExpFor actual
       in return $ c : incs
 
-    addContractEscapes :: Instruction
+    addContractEscapes :: Stmt
                           -> Value
                           -> [Inclusion Var Constructor]
                           -> (Int, Value)
@@ -431,12 +438,12 @@ buildValueFlowGraph ics summ is = do
 
 -- FIXME This should be a "not address taken" alloca - that is, not
 -- passed to any functions.
-callInstActualIsAlloca :: Instruction -> Int -> Bool
+callInstActualIsAlloca :: Stmt -> Int -> Bool
 callInstActualIsAlloca i ix =
-  case i of
-    CallInst { callArguments = (map fst -> args) } ->
+  case stmtInstr i of
+    Call _ _ _ args ->
       isAlloca args
-    InvokeInst { invokeArguments = (map fst -> args) } ->
+    Invoke _ _ args _ _ ->
       isAlloca args
     _ -> False
   where
@@ -445,7 +452,7 @@ callInstActualIsAlloca i ix =
         actual <- args `at` ix
         actualInst <- fromValue actual
         case actualInst of
-          AllocaInst {} -> return True
+          Alloca {} -> return True
           _ -> fail "Not an alloca"
 
 isEscapeAnnot :: ParamAnnotation -> Bool
@@ -460,17 +467,17 @@ isEscapeAnnot a =
 
 isPointerType :: (IsValue a) => a -> Bool
 isPointerType v =
-  case valueType v of
-    TypePointer _ _ -> True
+  case valType (toValue v) of
+    (PtrTo _) -> True
     _ -> False
 
 -- Given a GetElementPtrInst, return its base and the path accessed
 -- IFF the base was an Argument.
-argumentBasedField :: Instruction -> Maybe (Argument, AbstractAccessPath)
+argumentBasedField :: Stmt -> Maybe (Argument, AbstractAccessPath)
 argumentBasedField li = do
   accPath <- accessPath li
-  case valueContent' (accessPathBaseValue accPath) of
-    ArgumentC a -> return (a, abstractAccessPath accPath)
+  case valValue (valueContent' (accessPathBaseValue accPath)) of
+    ValIdent (IdentValArgument a) -> return (a, abstractAccessPath accPath)
     _ -> Nothing
 
 mustEscapeLocation :: Value -> (Bool, Maybe Argument)
@@ -479,21 +486,21 @@ mustEscapeLocation = snd . go mempty
     go visited v
       | S.member v visited = (visited, (False, Nothing))
       | otherwise =
-        case valueContent' v of
-          GlobalVariableC _ -> (visited', (True, Nothing))
-          ExternalValueC _ -> (visited', (True, Nothing))
-          ArgumentC a -> (visited', (True, Just a))
-          InstructionC CallInst {} -> (visited', (True, Nothing))
-          InstructionC InvokeInst {} -> (visited', (True, Nothing))
-          InstructionC LoadInst { loadAddress = la } ->
+        case valValue (valueContent' v) of
+          ValSymbol (SymValGlobal _) -> (visited', (True, Nothing))
+          ValSymbol (SymValDeclare _) -> (visited', (True, Nothing))
+          ValIdent (IdentValArgument a) -> (visited', (True, Just a))
+          ValIdent (IdentValStmt (stmtInstr -> Call {})) -> (visited', (True, Nothing))
+          ValIdent (IdentValStmt (stmtInstr -> Invoke {})) -> (visited', (True, Nothing))
+          ValIdent (IdentValStmt (stmtInstr -> Load la _ _)) ->
             go visited' la
-          InstructionC GetElementPtrInst { getElementPtrValue = base } ->
+          ValIdent (IdentValStmt (stmtInstr -> GEP _ base _)) ->
             go visited' base
-          InstructionC SelectInst { } ->
+          ValIdent (IdentValStmt (stmtInstr -> Select {})) ->
             let (visited'', pairs) = mapAccumR go visited' (flattenValue v)
                 argVal = mconcat $ map (First . snd) pairs
             in (visited'', (any fst pairs, getFirst argVal))
-          InstructionC PhiNode {} ->
+          ValIdent (IdentValStmt (stmtInstr -> Phi {})) ->
             let (visited'', pairs) = mapAccumR go visited' (flattenValue v)
                 argVal = mconcat $ map (First . snd) pairs
             in (visited'', (any fst pairs, getFirst argVal))
@@ -519,22 +526,22 @@ escapeResultToTestFormat er =
     fm = er ^. escapeFields
     am = er ^. escapeIntoArguments
     argTransform (a, (tag, _, _)) acc =
-      let aname = show (argumentName a)
-          f = argumentFunction a
-          fname = show (functionName f)
-      in M.insertWith' S.union fname (S.singleton (tag, aname)) acc
+      let aname = argName a
+          f = argDefine a
+          fname = prettySymbol (defName f)
+      in MS.insertWith S.union fname (S.singleton (tag, aname)) acc
     transform (a, (tag, _)) acc =
-      let f = argumentFunction a
-          fname = show (functionName f)
-          aname = show (argumentName a)
-      in M.insertWith' S.union fname (S.singleton (tag, aname)) acc
+      let f = argDefine a
+          fname = prettySymbol (defName f)
+          aname = argName a
+      in MS.insertWith S.union fname (S.singleton (tag, aname)) acc
     fieldTransform (a, fieldsAndInsts) acc =
-      let f = argumentFunction a
-          fname = show (functionName f)
-          aname = show (argumentName a)
+      let f = argDefine a
+          fname = prettySymbol (defName f)
+          aname = argName a
           tagsAndFields = S.toList $ S.map (\(tag, fld, _) -> (tag, fld)) fieldsAndInsts
           newEntries = S.fromList $ mapMaybe (toFieldRef aname) tagsAndFields
-      in M.insertWith' S.union fname newEntries acc
+      in MS.insertWith S.union fname newEntries acc
     toFieldRef aname (tag, fld) =
       case abstractAccessPathComponents fld of
         [AccessField ix] -> Just $ (tag, printf "%s.<%d>" aname ix)

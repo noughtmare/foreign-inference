@@ -21,23 +21,23 @@ import LLVM.Analysis.CDG
 import LLVM.Analysis.CFG
 import LLVM.Analysis.Dominance
 
-type FormulaBuilder = State (Set Instruction, HashMap (BasicBlock, Instruction) (Maybe (SInt32 -> SBool)))
+type FormulaBuilder = State (Set Stmt, HashMap (BasicBlock, Stmt) (Maybe (SInt32 -> SBool)))
 
-computeInducedFacts :: (HasFunction funcLike, HasBlockReturns funcLike,
+computeInducedFacts :: (HasDefine funcLike, HasBlockReturns funcLike,
                         HasCFG funcLike, HasCDG funcLike, HasDomTree funcLike)
                     => funcLike
                     -> BasicBlock
-                    -> Instruction
+                    -> Stmt
                     -> FormulaBuilder (Maybe (SInt32 -> SBool))
 computeInducedFacts funcLike bb0 target
   | S.null cdeps = return Nothing
   | otherwise = buildRelevantFacts bb0
   where
-    ti0 = basicBlockTerminatorInstruction bb0
+    ti0 = bbTerminatorStmt bb0
     cdeps = S.fromList $ controlDependencies funcLike ti0
     buildRelevantFacts bb
       | otherwise =
-        let ti = basicBlockTerminatorInstruction bb
+        let ti = bbTerminatorStmt bb
             dirCdeps = directControlDependencies funcLike ti
         in case dirCdeps of
           [] -> return Nothing
@@ -46,9 +46,9 @@ computeInducedFacts funcLike bb0 target
             fs <- mapM (memoBuilder bb) dirCdeps
             case catMaybes fs of
               [] -> return Nothing
-              fs' -> return $ Just $ \(x :: SInt32) -> bAny ($ x) fs'
+              fs' -> return $ Just $ \(x :: SInt32) -> sAny ($ x) fs'
 
-    memoBuilder :: BasicBlock -> Instruction
+    memoBuilder :: BasicBlock -> Stmt
                 -> FormulaBuilder (Maybe (SInt32 -> SBool))
     memoBuilder bb cdep = do
       (visited, s) <- get
@@ -60,25 +60,20 @@ computeInducedFacts funcLike bb0 target
             False -> do
               put (S.insert cdep visited, s)
               factBuilder bb cdep
-    factBuilder :: BasicBlock -> Instruction
+    factBuilder :: BasicBlock -> Stmt
                 -> FormulaBuilder (Maybe (SInt32 -> SBool))
     factBuilder bb cdep = do
-      let Just cdepBlock = instructionBasicBlock cdep
-      case cdep of
-        BranchInst { branchTrueTarget = tt
-                   , branchCondition = (valueContent' ->
-          InstructionC ICmpInst { cmpPredicate = p
-                                , cmpV1 = val1
-                                , cmpV2 = val2
-                                })}
+      let cdepBlock = stmtBasicBlock cdep
+      case stmtInstr cdep of
+        Br (valueContent' -> ValInstr (ICmp p val1 val2)) tt _
             | ignoreCasts val1 == toValue target ||
               ignoreCasts val2 == toValue target -> do
-                let doNeg = if blockDominates funcLike tt bb then id else bnot
+                let doNeg = if blockDominates funcLike tt bb then id else sNot
                     thisFact = inducedFact val1 val2 p doNeg
                 innerFact <- buildRelevantFacts cdepBlock
                 let fact' = liftedConjoin thisFact innerFact
                 (vis, st) <- get
-                put $ (vis, HM.insert (bb, cdep) fact' st)
+                put (vis, HM.insert (bb, cdep) fact' st)
                 return fact'
             | otherwise -> buildRelevantFacts cdepBlock
         _ -> return Nothing
@@ -89,66 +84,60 @@ liftedConjoin :: Maybe (SInt32 -> SBool) -> Maybe (SInt32 -> SBool)
 liftedConjoin Nothing Nothing = Nothing
 liftedConjoin f1@(Just _) Nothing = f1
 liftedConjoin Nothing f2@(Just _) = f2
-liftedConjoin (Just f1) (Just f2) = Just $ \(x :: SInt32) -> f1 x &&& f2 x
+liftedConjoin (Just f1) (Just f2) = Just $ \(x :: SInt32) -> f1 x .&& f2 x
 
 blockDominates :: (HasDomTree t) => t -> BasicBlock -> BasicBlock -> Bool
 blockDominates f b1 b2 = dominates f i1 i2
   where
-    i1 = basicBlockTerminatorInstruction b1
-    i2 = basicBlockTerminatorInstruction b2
+    i1 = bbTerminatorStmt b1
+    i2 = bbTerminatorStmt b2
 
 -- | Given a formula that holds up to the current location @mf@, augment
 -- it by conjoining the new fact we are introducing (if any).  The new
--- fact is derived from the relationship ('CmpPredicate') between the two
+-- fact is derived from the relationship ('ICmpOp) between the two
 -- 'Value' arguments.
-inducedFact :: Value -> Value -> CmpPredicate
+inducedFact :: Value -> Value -> ICmpOp
             -> (SBool -> SBool) -> Maybe (SInt32 -> SBool)
 inducedFact val1 val2 p doNeg = do
-  rel <- cmpPredicateToRelation p
-  case (valueContent' val1, valueContent' val2) of
-    (ConstantC ConstantInt { constantIntValue = (fromIntegral -> iv) }, _) ->
+  rel <- predicateToRelation p
+  case (valValue $ valueContent' val1, valValue $ valueContent' val2) of
+    (ValInteger (fromIntegral -> iv), _) ->
       return $ \(x :: SInt32) -> doNeg (iv `rel` x)
-    (_, ConstantC ConstantInt { constantIntValue = (fromIntegral -> iv)}) ->
+    (_, ValInteger (fromIntegral -> iv)) ->
       return $ \(x :: SInt32) -> doNeg (x `rel` iv)
-    (ConstantC ConstantPointerNull {}, _) ->
+    (ValNull, _) ->
       return $ \(x :: SInt32) -> doNeg (0 `rel` x)
-    (_, ConstantC ConstantPointerNull {}) ->
+    (_, ValNull) ->
       return $ \(x :: SInt32) -> doNeg (x `rel` 0)
     -- Not a comparison against a constant int, so we didn't learn anything.
     -- This is different from failure - we still had whatever information we
     -- had from before.
     _ -> fail "Cannot produce a fact here"
 
-cmpPredicateToRelation :: CmpPredicate -> Maybe (SInt32 -> SInt32 -> SBool)
-cmpPredicateToRelation p =
+predicateToRelation :: ICmpOp -> Maybe (SInt32 -> SInt32 -> SBool)
+predicateToRelation p =
   case p of
-    ICmpEq -> return (.==)
-    ICmpNe -> return (./=)
-    ICmpUgt -> return (.>)
-    ICmpUge -> return (.>=)
-    ICmpUlt -> return (.<)
-    ICmpUle -> return (.<=)
-    ICmpSgt -> return (.>)
-    ICmpSge -> return (.>=)
-    ICmpSlt -> return (.<)
-    ICmpSle -> return (.<=)
-    _ -> fail "cmpPredicateToRelation is a floating point comparison"
+    Ieq -> return (.==)
+    Ine -> return (./=)
+    Iugt -> return (.>)
+    Iuge -> return (.>=)
+    Iult -> return (.<)
+    Iule -> return (.<=)
+    Isgt -> return (.>)
+    Isge -> return (.>=)
+    Islt -> return (.<)
+    Isle -> return (.<=)
+    _ -> fail "predicateToRelation is a floating point comparison"
 
 isSat :: (SInt32 -> SBool) -> Bool
-isSat f = unsafePerformIO $ do
-  Just sr <- isSatisfiable Nothing f
-  return sr
+isSat f = unsafePerformIO (isSatisfiable f)
 
 ignoreCasts :: Value -> Value
 ignoreCasts v =
-  case valueContent v of
-    InstructionC BitcastInst { castedValue = cv } -> ignoreCasts cv
-    InstructionC TruncInst { castedValue = cv } -> ignoreCasts cv
-    InstructionC ZExtInst { castedValue = cv } -> ignoreCasts cv
-    InstructionC SExtInst { castedValue = cv } -> ignoreCasts cv
-    InstructionC IntToPtrInst { castedValue = cv } -> ignoreCasts cv
-    GlobalAliasC GlobalAlias { globalAliasTarget = t } -> ignoreCasts t
-    ConstantC ConstantValue { constantInstruction = BitcastInst { castedValue = cv } } -> ignoreCasts cv
-    _ -> valueContent v
+  case v of
+    ValInstr (Conv _ cv _) -> ignoreCasts cv
+    (valValue -> ValSymbol (SymValAlias GlobalAlias { aliasTarget = t })) -> ignoreCasts t
+    (valValue -> ValConstExpr (ConstConv _ cv _)) -> ignoreCasts cv
+    _ -> v
 
 

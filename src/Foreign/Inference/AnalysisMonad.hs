@@ -21,7 +21,9 @@ data Env env = Env { envDependencies :: DependencySummary
 
 newtype AnalysisMonad env st a =
   AnalysisMonad { unAnalysis :: RWS (Env env) Diagnostics st a }
-  deriving (Monad,
+  deriving (Functor,
+            Applicative,
+            Monad,
             MonadState st,
             MonadReader (Env env),
             MonadWriter Diagnostics)

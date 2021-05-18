@@ -99,7 +99,7 @@ instance Hashable ReturnContainerPath where
     s `hashWithSalt` p `hashWithSalt` i
 
 data SAPSummary =
-  SAPSummary { _sapReturns :: Map Function (HashSet ReturnPath)
+  SAPSummary { _sapReturns :: Map Define (HashSet ReturnPath)
                -- ^ The return paths for each function
              , _sapArguments :: Map Argument (HashSet WritePath)
                -- ^ Maps each Argument to the access paths it is
@@ -107,7 +107,7 @@ data SAPSummary =
              , _sapFinalize :: Map Argument (HashSet FinalizePath)
                -- ^ Maps each Argument to the access paths based on it
                -- that are finalized.
-             , _sapReturnContainer :: Map Function (HashSet ReturnContainerPath)
+             , _sapReturnContainer :: Map Define (HashSet ReturnContainerPath)
              , _sapDiagnostics :: Diagnostics
              }
   deriving (Generic)
@@ -120,7 +120,7 @@ finalizedPaths a s = do
   return $ map (\(FinalizePath p) -> p) $ HS.toList fps
 
 -- | Get the paths that function @f@ returns from its argument @a@
-returnedPaths :: Function -> Argument -> SAPSummary -> Maybe [AbstractAccessPath]
+returnedPaths :: Define -> Argument -> SAPSummary -> Maybe [AbstractAccessPath]
 returnedPaths f a s = do
   rps <- M.lookup f (s ^. sapReturns)
   let aix = argumentIndex a
@@ -138,15 +138,15 @@ writePaths a s = do
     unwrap (WritePath ix p) = do
       arg <- args `at` ix
       return (arg, p)
-    f = argumentFunction a
-    args = functionParameters f
+    f = argDefine a
+    args = defArgs f
 
-returnedContainerPaths :: Function -> SAPSummary -> Maybe [(Argument, AbstractAccessPath)]
+returnedContainerPaths :: Define -> SAPSummary -> Maybe [(Argument, AbstractAccessPath)]
 returnedContainerPaths f s = do
   rps <- M.lookup f (s ^. sapReturnContainer)
   return $ mapMaybe unwrap (HS.toList rps)
   where
-    args = functionParameters f
+    args = defArgs f
     unwrap (ReturnContainerPath p ix) = do
       arg <- args `at` ix
       return (arg, p)
@@ -154,6 +154,9 @@ returnedContainerPaths f s = do
 instance Eq SAPSummary where
   (SAPSummary r1 a1 f1 c1 _) == (SAPSummary r2 a2 f2 c2 _) =
     r1 == r2 && a1 == a2 && f1 == f2 && c1 == c2
+
+instance Semigroup SAPSummary where
+  (<>) = mappend
 
 instance Monoid SAPSummary where
   mempty = SAPSummary mempty mempty mempty mempty mempty
@@ -196,7 +199,7 @@ instance SummarizeModule SAPSummary where
       return [(FASAPReturn $ map toExternal $ HS.toList fr, [])]
 -}
 identifySAPs :: forall compositeSummary funcLike pta .
-                (FuncLike funcLike, HasFunction funcLike, PointsToAnalysis pta)
+                (FuncLike funcLike, HasDefine funcLike, PointsToAnalysis pta)
                 => DependencySummary
                 -> pta
                 -> Lens' compositeSummary SAPSummary
@@ -216,64 +219,58 @@ identifySAPs ds pta lns ptrelL finL =
 --
 -- At call intructions, extend callee paths that are passed some path
 -- based on an argument.
-sapAnalysis :: (FuncLike funcLike, HasFunction funcLike, PointsToAnalysis pta)
+sapAnalysis :: (FuncLike funcLike, HasDefine funcLike, PointsToAnalysis pta)
                => pta
                -> (SAPPTRelSummary, FinalizerSummary)
                -> funcLike
                -> SAPSummary
                -> Analysis SAPSummary
 sapAnalysis pta (ptrelSumm, finSumm) flike s =
-  foldM (sapTransfer pta f ptrelSumm finSumm) s (functionInstructions f)--  `debug`
+  foldM (sapTransfer pta f ptrelSumm finSumm) s (defStmts f)--  `debug`
     -- ("SAP: " ++ show (functionName f))
   where
-    f = getFunction flike
+    f = getDefine flike
 
 sapTransfer :: (PointsToAnalysis pta)
                => pta
-               ->Function
+               ->Define
                -> SAPPTRelSummary
                -> FinalizerSummary
                -> SAPSummary
-               -> Instruction
+               -> Stmt
                -> Analysis SAPSummary
 sapTransfer pta f ptrelSumm finSumm s i =
-  case i of
-    RetInst { retInstValue = Just (valueContent' ->
-      InstructionC PhiNode { phiIncomingValues = (map fst -> ivs) })} ->
+  case stmtInstr i of
+    Ret (valueContent' -> ValInstr (Phi _ (map fst -> ivs))) ->
       foldM (returnValueTransfer f) s (valuesAsInsts ivs)
-    RetInst { retInstValue = Just (valueContent' ->
-      InstructionC SelectInst { selectTrueValue = tv, selectFalseValue = fv })} ->
+    Ret (valueContent' -> ValInstr (Select _ tv fv)) ->
       foldM (returnValueTransfer f) s (valuesAsInsts [tv, fv])
-    RetInst { retInstValue = Just (valueContent' -> InstructionC ri) } ->
+    Ret (valValue . valueContent' -> ValIdent (IdentValStmt ri)) ->
       returnValueTransfer f s ri
 
-    StoreInst { storeValue = (valueContent' ->
-      InstructionC CallInst { callArguments = (map fst -> actuals)
-                            , callFunction = (valueContent' ->
-        FunctionC callee)})} ->
+    Store (valueContent' ->
+      ValInstr (Call _ _ (valValue . valueContent' -> ValSymbol (SymValDefine callee)) actuals)) _ _ _ ->
       storedReturnValueTransfer s i callee actuals
     -- We need to make an entry in sapArguments if we store an argument
     -- into some access path based on another argument
     --
     -- FIXME: If we are storing into the result of a callinst, check
     -- to see if that call has a summary that could be extended.
-    StoreInst { storeValue = (valueContent' -> ArgumentC sv) } ->
+    Store (valValue . valueContent' -> ValIdent (IdentValArgument sv)) _ _ _ ->
       storeTransfer ptrelSumm s i sv
 
-    CallInst { callFunction = callee
-             , callArguments = (map fst -> actuals) } ->
+    Call _ _ callee actuals ->
       calleeArgumentFold (callTransfer finSumm actuals) s pta callee actuals
 --      foldM (callTransfer finSumm callee actuals) s (zip [0..] actuals)
-    InvokeInst { invokeFunction = callee
-               , invokeArguments = (map fst -> actuals) } ->
+    Invoke _ callee actuals _ _ ->
       calleeArgumentFold (callTransfer finSumm actuals) s pta callee actuals
 --      foldM (callTransfer finSumm callee actuals) s (zip [0..] actuals)
 
     _ -> return s
 
 storedReturnValueTransfer :: SAPSummary
-                             -> Instruction
-                             -> Function
+                             -> Stmt
+                             -> Define
                              -> [Value]
                              -> Analysis SAPSummary
 storedReturnValueTransfer s i callee actuals =
@@ -291,7 +288,7 @@ storedReturnValueTransfer s i callee actuals =
         actual <- actuals `at` ix
         -- We only care about cases where the actual argument to
         -- @callee@ is a formal Argument of this function (the caller)
-        thisFormal <- fromValue actual
+        ValIdent (IdentValArgument thisFormal) <- pure (valValue actual)
         p' <- absDest `appendAccessPath` p
         let wp = HS.singleton $ WritePath (argumentIndex destArg) p'
         return $ (sapArguments %~ M.insertWith HS.union thisFormal wp) summ
@@ -326,13 +323,13 @@ callTransfer finSumm actuals callee s (argIx, actual) = do
   -- assumption could be lifted if it becomes an issue.
   case PAFinalize `elem` argFin of
     False -> return $ fromMaybe s $ do
-      calleeFunc <- fromValue callee
-      calleeFormal <- functionParameters calleeFunc `at` argIx
+      ValSymbol (SymValDefine calleeFunc) <- pure (valValue callee)
+      calleeFormal <- defArgs calleeFunc `at` argIx
       -- We now have to extend each of the summaries for this argument.
       -- Each summary tells us which other actual this formal is stored
       -- into.
 
-      case valueContent' actual of
+      case valValue (valueContent' actual) of
         -- This formal is @x@ in @f@; it is a *formal* argument passed
         -- to @g@ as an *actual* parameter.  'argumentTransfer'
         -- decides how to deal with the argument depending on the type
@@ -341,7 +338,7 @@ callTransfer finSumm actuals callee s (argIx, actual) = do
         -- Note: in either of these cases, the actual could be a phi
         -- node.  That is more likely to be important in the second
         -- case.
-        ArgumentC formal -> do
+        ValIdent (IdentValArgument formal) -> do
           let args = s ^. sapArguments
               fins = s ^. sapFinalize
               calleeFormalSumm = M.lookup calleeFormal args
@@ -354,7 +351,7 @@ callTransfer finSumm actuals callee s (argIx, actual) = do
         -- FinalizePath summary (we don't care about the case where a
         -- field of one argument is stored into the field of another),
         -- then we need to augment the FinalizePath.
-        InstructionC actualInst -> do
+        ValIdent (IdentValStmt actualInst) -> do
           (cap, baseArg) <- anyArgumentAccessPath actualInst
           let absPath = abstractAccessPath cap
               fins = s ^. sapFinalize
@@ -372,11 +369,9 @@ callTransfer finSumm actuals callee s (argIx, actual) = do
     -- (2) The instruction argument is a Call that returns an access
     --     path.
     True -> return $ fromMaybe s $ do
-      actualInst <- fromValue actual
-      case actualInst of
-        CallInst { callFunction = (valueContent' -> FunctionC argCallee)
-                 , callArguments = (map fst -> riActuals)
-                 } -> do
+      ValIdent (IdentValStmt actualInst) <- pure (valValue actual)
+      case stmtInstr actualInst of
+        Call _ _ (valValue . valueContent' -> ValSymbol (SymValDefine argCallee)) riActuals -> do
           retPaths <- M.lookup argCallee (s ^. sapReturns)
           return $ F.foldr (toFinalizedPath riActuals) s retPaths
         _ -> do
@@ -433,8 +428,8 @@ callTransfer finSumm actuals callee s (argIx, actual) = do
     augmentTransfer formal (WritePath dstArg p) argSumm =
       fromMaybe argSumm $ do
         baseActual <- actuals `at` dstArg
-        case valueContent' baseActual of
-          ArgumentC argActual -> do
+        case valValue (valueContent' baseActual) of
+          ValIdent (IdentValArgument argActual) -> do
             -- In this case, the actual argument is just an argument
             -- (could be considered a degenerate access path).  This
             -- is the case where an argument is passed-through to
@@ -450,7 +445,7 @@ callTransfer finSumm actuals callee s (argIx, actual) = do
           _ -> do
             -- In this case, the actual argument is some field or
             -- array access.  That is @t->s@
-            actualInst <- fromValue baseActual
+            ValIdent (IdentValStmt actualInst) <- pure (valValue baseActual)
             -- baseArg is @t@ in the example
             (cap', baseArg) <- anyArgumentAccessPath actualInst
             let absPath = abstractAccessPath cap'
@@ -474,7 +469,7 @@ callTransfer finSumm actuals callee s (argIx, actual) = do
 -- Argument 1 is stored into field zero of argument 0.
 storeTransfer :: SAPPTRelSummary
                  -> SAPSummary
-                 -> Instruction -- ^ The store instruction
+                 -> Stmt -- ^ The store instruction
                  -> Argument -- ^ The argument being stored
                  -> Analysis SAPSummary
 storeTransfer ptrelSumm s i storedArg = do
@@ -485,7 +480,7 @@ storeTransfer ptrelSumm s i storedArg = do
     rcp <- accessPathBaseReturnContainerPath f storedArg sp
     return $ (sapReturnContainer %~ M.insertWith HS.union f (HS.singleton rcp)) s'
   where
-    f = argumentFunction storedArg
+    f = argDefine storedArg
     addStore summ res' =
       (sapArguments %~ M.insertWith HS.union storedArg (HS.fromList res')) summ
     toWritePath p acc = fromMaybe acc $ do
@@ -495,12 +490,12 @@ storeTransfer ptrelSumm s i storedArg = do
       let wp = WritePath (argumentIndex base) sp
       return $! wp : acc
 
-accessPathBaseReturnContainerPath :: Function
+accessPathBaseReturnContainerPath :: Define
                                      -> Argument
                                      -> AccessPath
                                      -> Maybe ReturnContainerPath
 accessPathBaseReturnContainerPath f a p = do
-  RetInst { retInstValue = Just rv } <- functionExitInstruction f
+  (stmtInstr -> Ret rv) <- defExitStmt f
   case pathBaseIsReturned p rv of
     False -> Nothing
     True -> do
@@ -510,7 +505,7 @@ accessPathBaseReturnContainerPath f a p = do
       -- the bitcasts (and therefore all of the useful type
       -- information)
       let absPath = abstractAccessPath p
-          absPath' = absPath { abstractAccessPathBaseType = valueType rv }
+          absPath' = absPath { abstractAccessPathBaseType = valType rv }
       return $ ReturnContainerPath absPath' (argumentIndex a)
 
 -- Note that this returns true if /any/ value in a returned phi node
@@ -530,9 +525,9 @@ pathBaseIsReturned p v = any ((==bv) . stripBitcasts) (flattenValue v)
 -- access path.  If that concrete access path is rooted at an
 -- argument, we get the index of that argument and then append the
 -- access paths.
-transitiveReturnTransfer :: Function
+transitiveReturnTransfer :: Define
                             -> SAPSummary
-                            -> Function
+                            -> Define
                             -> [Value]
                             -> Analysis SAPSummary
 transitiveReturnTransfer f s@(SAPSummary rs _ _ _ _) callee args =
@@ -555,15 +550,13 @@ transitiveReturnTransfer f s@(SAPSummary rs _ _ _ _) callee args =
 
 -- FIXME: This could actually probably work on external functions,
 -- too, if we are careful in representing access paths
-returnValueTransfer :: Function
+returnValueTransfer :: Define
                        -> SAPSummary
-                       -> Instruction
+                       -> Stmt
                        -> Analysis SAPSummary
-returnValueTransfer f s CallInst { callArguments = (map fst -> args)
-                                 , callFunction = (valueContent' -> FunctionC callee) } =
+returnValueTransfer f s (stmtInstr -> Call _ _ (valValue . valueContent' -> ValSymbol (SymValDefine callee)) args) =
   transitiveReturnTransfer f s callee args
-returnValueTransfer f s InvokeInst { invokeArguments = (map fst -> args)
-                                   , invokeFunction = (valueContent' -> FunctionC callee) } =
+returnValueTransfer f s (stmtInstr -> Invoke _ (valValue . valueContent' -> ValSymbol (SymValDefine callee)) args _ _) =
   transitiveReturnTransfer f s callee args
 returnValueTransfer f s i = return $ fromMaybe s $ do
   p <- accessPath i
@@ -577,7 +570,7 @@ returnValueTransfer f s i = return $ fromMaybe s $ do
 
 -- Utilities
 
-valuesAsInsts :: [Value] -> [Instruction]
+valuesAsInsts :: [Value] -> [Stmt]
 valuesAsInsts = mapMaybe fromValue
 
 accessPathBaseArgument :: AccessPath -> Maybe Argument
@@ -590,31 +583,31 @@ accessPathBaseArgument p =
 -- The path returned is arbitrary.  More complete handling would deal
 -- with /all/ such paths.
 anyArgumentAccessPath :: (Failure AccessPathError m)
-                         => Instruction
+                         => Stmt
                          -> m (AccessPath, Argument)
 anyArgumentAccessPath i =
-  case i of
-    PhiNode { phiIncomingValues = (map fst -> ivs) } ->
+  case stmtInstr i of
+    Phi _ (map fst -> ivs) ->
       tryAccessPath ivs
     _ -> do
       p <- accessPath i
-      case valueContent' (accessPathBaseValue p) of
-        ArgumentC a -> return (p, a)
+      case valValue (valueContent' (accessPathBaseValue p)) of
+        ValIdent (IdentValArgument a) -> return (p, a)
         _ -> failure $ NoPathError (toValue i)
   where
     tryAccessPath [] = failure $ NoPathError (toValue i)
     tryAccessPath (v:rest) = maybe (tryAccessPath rest) return $ do
       vi <- fromValue v
       p <- accessPath vi
-      case valueContent' (accessPathBaseValue p) of
-        ArgumentC a -> return (p, a)
+      case valValue (valueContent' (accessPathBaseValue p)) of
+        ValIdent (IdentValArgument a) -> return (p, a)
         _ -> fail "try next"
 
 accessPathOrArgument :: Value -> Maybe (Either Argument AccessPath)
 accessPathOrArgument v =
-  case valueContent' v of
-    ArgumentC a -> return (Left a)
-    InstructionC i -> do
+  case valValue (valueContent' v) of
+    ValIdent (IdentValArgument a) -> return (Left a)
+    ValIdent (IdentValStmt i) -> do
       (cap, _) <- anyArgumentAccessPath i
       return (Right cap)
     _ -> Nothing
@@ -659,10 +652,10 @@ sapReturnResultToTestFormat =
   M.fromList . map toTestFormat . M.toList . (^. sapReturns)
   where
     toTestFormat (f, s) =
-      (identifierAsString (functionName f),
+      ((\(Symbol str) -> str) (defName f),
        S.fromList (map fromRetPath (HS.toList s)))
     fromRetPath (ReturnPath ix p) =
-      (ix, show (abstractAccessPathBaseType p),
+      (ix, prettyType (abstractAccessPathBaseType p),
        abstractAccessPathComponents p)
 
 sapArgumentResultToTestFormat :: SAPSummary -> Map (String, String) (Set (Int, String, [AccessType]))
@@ -670,12 +663,12 @@ sapArgumentResultToTestFormat =
   M.fromList . map toTestFormat . M.toList . (^. sapArguments)
   where
     toTestFormat (a, s) =
-      let f = argumentFunction a
-          p1 = (identifierAsString (functionName f),
-                identifierAsString (argumentName a))
+      let f = argDefine a
+          p1 = ((\(Symbol str) -> str) (defName f),
+                argName a)
       in (p1, S.fromList (map fromPath (HS.toList s)))
     fromPath (WritePath ix p) =
-      (ix, show (abstractAccessPathBaseType p),
+      (ix, prettyType (abstractAccessPathBaseType p),
        abstractAccessPathComponents p)
 
 sapFinalizeResultToTestFormat :: SAPSummary -> Map (String, String) (Set (String, [AccessType]))
@@ -683,10 +676,10 @@ sapFinalizeResultToTestFormat =
   M.fromList . map toTestFormat . M.toList . (^. sapFinalize)
   where
     toTestFormat (a, s) =
-      let f = argumentFunction a
-          p1 = (identifierAsString (functionName f),
-                identifierAsString (argumentName a))
+      let f = argDefine a
+          p1 = ((\(Symbol str) -> str) (defName f),
+                argName a)
       in (p1, S.fromList (map fromPath (HS.toList s)))
     fromPath (FinalizePath p) =
-      (show (abstractAccessPathBaseType p),
+      (prettyType (abstractAccessPathBaseType p),
        abstractAccessPathComponents p)

@@ -112,7 +112,7 @@ type FeatureVector = Vector Double
 -- | Iterate over every BasicBlock in the library.  If the basic block is not
 -- in BasicFacts, we don't believe it is an error handling context, so
 -- increment the notError count for each of its called functions.
-computeFeatures :: (HasFunction funcLike, HasBlockReturns funcLike)
+computeFeatures :: (HasDefine funcLike, HasBlockReturns funcLike)
                 => BasicFacts
                 -> [funcLike]
                 -> Map Value FeatureVector
@@ -131,41 +131,41 @@ computeFeatures bf funcs =
 -- | Returns True if the input Function is of type Int and can return
 -- more than one value.  This is a reasonable approximation of functions
 -- that could possibly returning an error code.
-complexIntFunction :: (HasFunction funcLike)
+complexIntFunction :: (HasDefine funcLike)
                    => funcLike -> Bool
 complexIntFunction funcLike =
-  case functionReturnType f of
-    TypeInteger _ -> length (exitValues f) > 1
+  case defRetType f of
+    PrimType Integer {} -> length (exitValues f) > 1
     _ -> False
   where
-    f = getFunction funcLike
+    f = getDefine funcLike
 
-exitValues :: Function -> [Value]
-exitValues f = concatMap fromReturn exitInsts
+exitValues :: Define -> [Value]
+exitValues f = concatMap (fromReturn . stmtInstr) exitInsts
   where
-    exitInsts = functionExitInstructions f
+    exitInsts = defExitStmts f
     fromReturn i =
       case i of
-        RetInst { retInstValue = Just rv } ->
+        Ret rv ->
           case valueContent' rv of
-            InstructionC PhiNode {} -> filter (/= rv) $ flattenValue rv
+            ValInstr Phi {} -> filter (/= rv) $ flattenValue rv
             _ -> [rv]
         _ -> []
 
 -- | A function could return an error if it returns an integral type
 -- and values besides 0, 1, and sign-extendex compares.  That is,
 -- non-bool functions.
-couldReturnError :: (HasFunction funcLike) => funcLike -> Bool
+couldReturnError :: (HasDefine funcLike) => funcLike -> Bool
 couldReturnError funcLike =
   complexIntFunction f && not (null nonBoolRets)
   where
     nonBoolRets = filter notBool (exitValues f)
-    f = getFunction funcLike
+    f = getDefine funcLike
     notBool v =
       case valueContent' v of
-        ConstantC ConstantInt { constantIntValue = iv } ->
+        (valValue -> ValInteger iv) ->
           iv /= 1 && iv /= 0
-        InstructionC ZExtInst { castedValue = (valueContent -> InstructionC ICmpInst {})} -> False
+        ValInstr (Conv ZExt (ValInstr ICmp {}) _) -> False
         _ -> True
 
 featureVectorLength :: Double
@@ -202,16 +202,16 @@ normalize d
 
 -- compute block returns here - if there is a constant return
 -- value, classify it as a possible error context
-computeFuncFeatures :: (HasFunction funcLike, HasBlockReturns funcLike)
+computeFuncFeatures :: (HasDefine funcLike, HasBlockReturns funcLike)
                     => BasicFacts
                     -> Map Value Feature
                     -> funcLike
                     -> Map Value Feature
 computeFuncFeatures bf m funcLike =
-  F.foldl' (computeBlockFeatures bf isComplex) m (functionBody f)
+  F.foldl' (computeBlockFeatures bf isComplex) m (defBody f)
   where
     isComplex = complexIntFunction funcLike
-    f = getFunction funcLike
+    f = getDefine funcLike
     -- brs = getBlockReturns funcLike
 
 computeBlockFeatures :: BasicFacts
@@ -221,24 +221,25 @@ computeBlockFeatures :: BasicFacts
                      -> Map Value Feature
 computeBlockFeatures bf isComplex m bb
   | Just baseFact <- M.lookup bb bf =
-    F.foldl' (calleeInContext baseFact) m (basicBlockInstructions bb)
-  | otherwise = F.foldl' (calleeNotError isComplex) m (basicBlockInstructions bb)
+    F.foldl' (calleeInContext baseFact) m (bbStmts bb)
+  | otherwise = F.foldl' (calleeNotError isComplex) m (map stmtInstr $ bbStmts bb)
 
 calleeInContext :: BaseFact -> Map Value Feature
-                -> Instruction -> Map Value Feature
+                -> Stmt -> Map Value Feature
 calleeInContext SuccessBlock m i
-  | Just cv <- directCallTarget i =
+  | Just cv <- directCallTarget (stmtInstr i) =
     M.alter (update (calledInSuccessContext %~ (+1))) cv m
   | otherwise = m
 calleeInContext (ErrorBlock args) m i
-  | Just cv <- directCallTarget i, S.member (toValue i) args =
+  | Just cv <- dcTarget, S.member (toValue i) args =
     M.alter (update (usedAsArgumentInErrorContext %~ (+1))) cv m
-  | Just cv <- directCallTarget i =
+  | Just cv <- dcTarget =
     M.alter (update (calledInErrorContext %~ (+1))) cv m
   | otherwise = m
+  where dcTarget = directCallTarget (stmtInstr i)
 
 
-calleeNotError :: Bool -> Map Value Feature -> Instruction -> Map Value Feature
+calleeNotError :: Bool -> Map Value Feature -> Instr -> Map Value Feature
 calleeNotError isComplex m i
   | Just cv <- directCallTarget i
   , isComplex = M.alter (update (calledInPossibleErrorContext %~ (+1))) cv m
@@ -248,20 +249,20 @@ calleeNotError isComplex m i
 
 -- | If the value is a call inst to a known function (external or locally defined),
 -- return the target
-directCallTarget :: Instruction -> Maybe Value
+directCallTarget :: Instr -> Maybe Value
 directCallTarget v =
   case v of
-    CallInst { callFunction = cv } ->
-      case valueContent' cv of
-        ExternalFunctionC _ -> return (stripBitcasts cv)
-        FunctionC _ -> return (stripBitcasts cv)
+    Call _ _ cv _ ->
+      case valValue $ valueContent' cv of
+        ValSymbol SymValDeclare {} -> return (stripBitcasts cv)
+        ValSymbol SymValDefine {} -> return (stripBitcasts cv)
         _ -> fail "Not a direct call"
     _ -> fail "Not a call"
 
 -- | Compute the features for each called value in the library (using
 -- the BasicFacts and funcLikes).  Classify each one using the classifier.
 -- Insert each 'ErrorReporter' into the result set.
-classifyErrorFunctions :: (HasFunction funcLike, HasBlockReturns funcLike)
+classifyErrorFunctions :: (HasDefine funcLike, HasBlockReturns funcLike)
                        => BasicFacts
                        -> [funcLike]
                        -> (FeatureVector -> ErrorFuncClass)

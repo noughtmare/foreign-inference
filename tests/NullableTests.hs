@@ -6,13 +6,16 @@ import qualified Data.Set as S
 import System.FilePath ( (<.>) )
 import System.Environment ( getArgs, withArgs )
 import Test.HUnit ( assertEqual )
+import qualified Data.ByteString as B
+import Control.Lens (to)
 
 import LLVM.Analysis
 import LLVM.Analysis.CallGraph
 import LLVM.Analysis.CallGraphSCCTraversal
 import LLVM.Analysis.PointsTo
 import LLVM.Analysis.Util.Testing
-import LLVM.Parse
+import Data.LLVM.BitCode
+import Text.LLVM.Resolve
 
 import Foreign.Inference.Interface
 import Foreign.Inference.Preprocessing
@@ -36,7 +39,7 @@ main = do
                         ]
   withArgs [] $ testAgainstExpected requiredOptimizations parser testDescriptors
   where
-    parser = parseLLVMFile defaultParserOptions
+    parser _f h = fmap (resolve . (\(Right x) -> x)) . parseBitCode =<< B.hGetContents h
 
 analyzeNullable ds m =
   nullSummaryToTestFormat (_nullableSummary res)
@@ -45,7 +48,7 @@ analyzeNullable ds m =
     cg = callGraph m pta []
     analyses :: [ComposableAnalysis AnalysisSummary FunctionMetadata]
     analyses = [ identifyReturns ds returnSummary
-               , identifyNullable ds nullableSummary returnSummary
+               , identifyNullable ds nullableSummary returnSummary (errorHandlingSummary . to Just)
                ]
     analysisFunc = callGraphComposeAnalysis analyses
     res = callGraphSCCTraversal cg analysisFunc mempty

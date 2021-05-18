@@ -120,8 +120,8 @@ import Foreign.Inference.Interface
 -- debug = flip trace
 
 data SAPPTRelSummary =
-  SAPPTRelSummary { _sapPaths :: Map Function (Map AccessPath (Set AccessPath))
-                  , _sapValues :: Map Function (Map Value (Set AccessPath))
+  SAPPTRelSummary { _sapPaths :: Map Define (Map AccessPath (Set AccessPath))
+                  , _sapValues :: Map Define (Map Value (Set AccessPath))
                   , _sapDiagnostics :: Diagnostics
                   }
   deriving (Generic)
@@ -139,6 +139,9 @@ $(makeLenses ''SAPInfo)
 instance Eq SAPPTRelSummary where
   (SAPPTRelSummary s1 v1 _) == (SAPPTRelSummary s2 v2 _) =
     s1 == s2 && v1 == v2
+
+instance Semigroup SAPPTRelSummary where
+  (<>) = mappend
 
 instance Monoid SAPPTRelSummary where
   mempty = SAPPTRelSummary mempty mempty mempty
@@ -158,7 +161,7 @@ instance SummarizeModule SAPPTRelSummary where
   summarizeFunction _ _ = []
   summarizeArgument _ _ = []
 
-identifySAPPTRels :: (FuncLike funcLike, HasFunction funcLike, HasCFG funcLike)
+identifySAPPTRels :: (FuncLike funcLike, HasDefine funcLike, HasCFG funcLike)
                      => DependencySummary
                      -> Lens' compositeSummary SAPPTRelSummary
                      -> ComposableAnalysis compositeSummary funcLike
@@ -176,7 +179,7 @@ top = SAPInfo mempty mempty
 
 type Analysis = AnalysisMonad () ()
 
-sapAnalysis :: (FuncLike funcLike, HasFunction funcLike, HasCFG funcLike)
+sapAnalysis :: (FuncLike funcLike, HasDefine funcLike, HasCFG funcLike)
                => funcLike -> SAPPTRelSummary -> Analysis SAPPTRelSummary
 sapAnalysis funcLike s = do
   let analysis = fwdDataflowAnalysis top meet sapTransfer
@@ -186,13 +189,12 @@ sapAnalysis funcLike s = do
       addPaths = sapPaths %~ M.insert f (invertMap ps)
   return $ addVals $ addPaths s
   where
-    f = getFunction funcLike
+    f = getDefine funcLike
 
-sapTransfer :: SAPInfo -> Instruction -> Analysis SAPInfo
+sapTransfer :: SAPInfo -> Stmt -> Analysis SAPInfo
 sapTransfer s i =
-  case i of
-    StoreInst { storeAddress = (valueContent' -> InstructionC sai)
-              , storeValue = sv } ->
+  case stmtInstr i of
+    Store sv (valValue . valueContent' -> ValIdent (IdentValStmt sai)) _ _ ->
       return $ fromMaybe s $ do
         -- We always need the path of the store address; stores to
         -- plain (non-access path) values aren't interesting here.
@@ -224,7 +226,9 @@ sapTransfer s i =
     _ -> return s
 
 valueAsAccessPath :: Value -> Maybe AccessPath
-valueAsAccessPath v = fromValue v >>= accessPath
+valueAsAccessPath v = case valValue v of
+  ValIdent (IdentValStmt s) -> accessPath s
+  _                         -> Nothing
 
 
 appendConcretePath :: AccessPath -> AccessPath -> AccessPath
@@ -246,7 +250,7 @@ synthesizedPathsFor (SAPPTRelSummary _ v _) a = fromMaybe [] $ do
   let res = F.foldr (extendPaths vs) mempty endValPaths
   return (S.toList res)
   where
-    f = argumentFunction a
+    f = argDefine a
     extendPaths vs p0 acc
      | S.member p0 acc = acc
      | otherwise = fromMaybe (S.insert p0 acc) $ do

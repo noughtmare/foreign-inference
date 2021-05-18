@@ -1,6 +1,7 @@
 {-# LANGUAGE RankNTypes, ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns, DeriveGeneric, TemplateHaskell #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE FlexibleContexts #-}
 -- | This analysis identifies output parameters.
 --
 -- Output parameters are those pointer parameters whose target memory
@@ -36,9 +37,11 @@ import Control.Monad ( foldM )
 import Data.List ( find, groupBy )
 import Data.Map ( Map )
 import qualified Data.Map as M
+import qualified Data.Map.Strict as MS
 import Data.Monoid
 import Data.Set ( Set )
 import qualified Data.Set as S
+import Data.Maybe (mapMaybe)
 
 import LLVM.Analysis
 import LLVM.Analysis.CFG
@@ -62,7 +65,7 @@ data ArgumentDirection = ArgIn
                        -- | ArgOutAlloc (Set Instruction, OutFinalizer)
                          -- ^ Instructions and their associated finalizer
                        | ArgBoth
-                       deriving (Eq, Ord)
+                       deriving (Eq, Ord, Generic)
 
 instance Show ArgumentDirection where
   show ArgIn = "in"
@@ -96,6 +99,9 @@ $(makeLenses ''OutInfo)
 instance Eq OutputSummary where
   (OutputSummary s1 fs1 _) == (OutputSummary s2 fs2 _) =
     s1 == s2 && fs1 == fs2
+
+instance Semigroup OutputSummary where
+  (<>) = mappend
 
 instance Monoid OutputSummary where
   mempty = OutputSummary mempty mempty mempty
@@ -143,8 +149,8 @@ combineWitnesses = concatMap (snd . snd)
 -- fields in the struct.  Otherwise, return Nothing.
 argumentFieldCount :: Argument -> Maybe Int
 argumentFieldCount a =
-  case argumentType a of
-    TypePointer (TypeStruct _ flds _) _ -> Just (length flds)
+  case argType a of
+    (PtrTo (Struct _ flds _)) -> Just (length flds)
     _ -> Nothing
 
 data OutData = OD { moduleSummary :: OutputSummary
@@ -153,7 +159,7 @@ data OutData = OD { moduleSummary :: OutputSummary
 -- | Note that array parameters are not out parameters, so we rely on
 -- the Array analysis to let us filter those parameters out of our
 -- results.
-identifyOutput :: forall compositeSummary funcLike . (FuncLike funcLike, HasCFG funcLike, HasFunction funcLike)
+identifyOutput :: forall compositeSummary funcLike . (FuncLike funcLike, HasCFG funcLike, HasDefine funcLike)
                   => Module
                   -> DependencySummary
                   -> Lens' compositeSummary OutputSummary
@@ -183,7 +189,7 @@ meetOutInfo (OI m1 mf1) (OI m2 mf2) =
 
 type Analysis = AnalysisMonad OutData ()
 
-outAnalysis :: (FuncLike funcLike, HasFunction funcLike, HasCFG funcLike)
+outAnalysis :: (FuncLike funcLike, HasDefine funcLike, HasCFG funcLike)
                => Module
                -> funcLike
                -> OutputSummary
@@ -202,7 +208,7 @@ outAnalysis m funcLike s = do
   -- collisions (could arise while processing SCCs).
   return $! (outputSummary %~ M.union exitInfo') $ (outputFieldSummary %~ M.union fexitInfo') s
   where
-    f = getFunction funcLike
+    f = getDefine funcLike
 
 -- | If the given @callInst@ is an allocated value (i.e., call to an
 -- allocator) and it does not escape via any means other than the
@@ -231,59 +237,53 @@ outAnalysis m funcLike s = do
 -- Note, we don't use valueContent' to strip bitcasts here since
 -- accesses to bitfields use lots of interesting bitcasts and give us
 -- false positives.
-outTransfer :: Module -> OutInfo -> Instruction -> Analysis OutInfo
+outTransfer :: Module -> OutInfo -> Stmt -> Analysis OutInfo
 outTransfer m info i =
-  case i of
-    LoadInst { loadAddress = (valueContent -> ArgumentC ptr) } ->
+  case stmtInstr i of
+    Load (valValue -> ValIdent (IdentValArgument ptr)) _ _ ->
       return $! merge outputInfo i ptr ArgIn info
-    StoreInst { storeAddress = (valueContent -> ArgumentC ptr) } ->
+    Store _ (valValue -> ValIdent (IdentValArgument ptr)) _ _ ->
       return $! merge outputInfo i ptr ArgOut info
-    AtomicRMWInst { atomicRMWPointer = (valueContent -> ArgumentC ptr) } ->
+    AtomicRW _ _ (valValue -> ValIdent (IdentValArgument ptr)) _ _ _ ->
       return $! merge outputInfo i ptr ArgBoth info
-    AtomicCmpXchgInst { atomicCmpXchgPointer = (valueContent -> ArgumentC ptr) } ->
+    CmpXchg _ _ (valValue -> ValIdent (IdentValArgument ptr)) _ _ _ _ _ ->
       return $! merge outputInfo i ptr ArgBoth info
 
-    LoadInst { loadAddress = (valueContent -> InstructionC
-      GetElementPtrInst { getElementPtrValue = (valueContent -> ArgumentC ptr)
-                        , getElementPtrIndices = [ (valueContent -> ConstantC (ConstantInt _ _ 0))
-                                                 , (valueContent -> ConstantC (ConstantInt _ _ fldNo))
-                                                 ]
-                        })} ->
+    Load (ValInstr
+      (GEP _ (valValue -> ValIdent (IdentValArgument ptr))
+          [ valValue -> ValInteger 0
+          , valValue -> ValInteger fldNo
+          ])) _ _ ->
       return $! merge outputFieldInfo i (ptr, fromIntegral fldNo) ArgIn info
-    StoreInst { storeAddress = (valueContent -> InstructionC
-      GetElementPtrInst { getElementPtrValue = (valueContent -> ArgumentC ptr)
-                        , getElementPtrIndices = [ (valueContent -> ConstantC (ConstantInt _ _ 0))
-                                                 , (valueContent -> ConstantC (ConstantInt _ _ fldNo))
-                                                 ]
-                        })} ->
+    Store _ (ValInstr
+      (GEP _ (valValue -> ValIdent (IdentValArgument ptr))
+          [ valValue -> ValInteger 0
+          , valValue -> ValInteger fldNo
+          ])) _ _ ->
       return $! merge outputFieldInfo i (ptr, fromIntegral fldNo) ArgOut info
-    AtomicRMWInst { atomicRMWPointer = (valueContent -> InstructionC
-      GetElementPtrInst { getElementPtrValue = (valueContent -> ArgumentC ptr)
-                        , getElementPtrIndices = [ (valueContent -> ConstantC (ConstantInt _ _ 0))
-                                                 , (valueContent -> ConstantC (ConstantInt _ _ fldNo))
-                                                 ]
-                        })} ->
+    AtomicRW _ _ (ValInstr
+      (GEP _ (valValue -> ValIdent (IdentValArgument ptr))
+          [ valValue -> ValInteger 0
+          , valValue -> ValInteger fldNo
+          ])) _ _ _ ->
       return $! merge outputFieldInfo i (ptr, fromIntegral fldNo) ArgBoth info
-    AtomicCmpXchgInst { atomicCmpXchgPointer = (valueContent -> InstructionC
-      GetElementPtrInst { getElementPtrValue = (valueContent -> ArgumentC ptr)
-                        , getElementPtrIndices = [ (valueContent -> ConstantC (ConstantInt _ _ 0))
-                                                 , (valueContent -> ConstantC (ConstantInt _ _ fldNo))
-                                                 ]
-                        })} ->
+    CmpXchg _ _ (ValInstr
+      (GEP _ (valValue -> ValIdent (IdentValArgument ptr))
+          [ valValue -> ValInteger 0
+          , valValue -> ValInteger fldNo
+          ])) _ _ _ _ _ ->
       return $! merge outputFieldInfo i (ptr, fromIntegral fldNo) ArgBoth info
 
-    CallInst { callFunction = f, callArguments = args } ->
-      callTransfer m info i f (map fst args)
-    InvokeInst { invokeFunction = f, invokeArguments = args }->
-      callTransfer m info i f (map fst args)
+    Call _ _ f args -> callTransfer m info i f args
+    Invoke _ f args _ _-> callTransfer m info i f args
 
     _ -> return info
 
 
 isMemcpy :: Value -> Bool
 isMemcpy v =
-  case valueContent' v of
-    ExternalFunctionC ExternalFunction { externalFunctionName = fname } ->
+  case valValue (valueContent' v) of
+    (ValSymbol (SymValDeclare Declare { decName = fname })) ->
       show fname == "@llvm.memcpy.p0i8.p0i8.i32" || show fname == "@llvm.memcpy.p0i8.p0i8.i64"
     _ -> False
 
@@ -291,7 +291,7 @@ isMemcpy v =
 -- | A broken out transfer function for calls.  This deals with traversing
 -- the list of arguments in a reasonable way to correctly handle argument
 -- aliasing.  See Note [Argument Aliasing]
-callTransfer :: Module -> OutInfo -> Instruction -> Value -> [Value] -> Analysis OutInfo
+callTransfer :: Module -> OutInfo -> Stmt -> Value -> [Value] -> Analysis OutInfo
 callTransfer m info i f args = do
   let indexedArgs = zip [0..] args
   modSumm <- analysisEnvironment moduleSummary -- FIXME: Change this to an OutputSummary?
@@ -304,24 +304,24 @@ callTransfer m info i f args = do
       foldM (checkOutArg modSumm) info'' indexedArgs
   where
     checkInOutArg ms acc (ix, arg) =
-      case valueContent' arg of
-        ArgumentC a -> do
+      case valValue (valueContent' arg) of
+        ValIdent (IdentValArgument a) -> do
           attrs <- lookupArgumentSummaryList ms f ix
           case PAInOut `elem` attrs of
             True -> return $! merge outputInfo i a ArgBoth acc
             False -> return acc
         _ -> return acc
     checkInArg ms acc (ix, arg) =
-      case valueContent' arg of
-        ArgumentC a -> do
+      case valValue (valueContent' arg) of
+        ValIdent (IdentValArgument a) -> do
           attrs <- lookupArgumentSummaryList ms f ix
           case find isAnyOut attrs of
             Just _ -> return acc
             Nothing -> return $ merge outputInfo i a ArgIn acc
         _ -> return acc
     checkOutArg ms acc (ix, arg) =
-      case valueContent' arg of
-        ArgumentC a -> do
+      case valValue (valueContent' arg) of
+        ValIdent (IdentValArgument a) -> do
           attrs <- lookupArgumentSummaryList ms f ix
           case PAOut `elem` attrs of
             True -> return $! merge outputInfo i a ArgOut acc
@@ -332,13 +332,46 @@ isAnyOut :: ParamAnnotation -> Bool
 isAnyOut PAOut = True
 isAnyOut _ = False
 
+
+-- TODO Move these general functions somewhere else
+
+getTypeSizeInBits :: Module -> Type -> Maybe Int
+getTypeSizeInBits m t = case t of
+  (PrimType t') -> case t' of
+    Label -> getPointerSizeInBits m 0
+    (Integer w) -> Just $ fromIntegral w
+    (FloatType Half) -> Just 16
+    (FloatType Float) -> Just 32
+    (FloatType Double) -> Just 64
+    (FloatType X86_fp80) -> Just 80
+    (FloatType Fp128) -> Just 128
+    (FloatType PPC_fp128) -> Just 128
+    X86mmx -> Just 64
+    _ -> Nothing
+  (Array w t') -> (fromIntegral w *) <$> getTypeSizeInBits m t'
+  (PtrTo _) -> getPointerSizeInBits m 0 -- TODO deal with other address spaces
+  (Struct _ ts _) -> sum <$> traverse (getTypeSizeInBits m) ts
+  (Vector w t') -> (fromIntegral w *) <$> getTypeSizeInBits m t'
+  _ -> Nothing
+
+getPointerSizeInBits :: Module -> Int -> Maybe Int
+getPointerSizeInBits m _addrspace = safeHead $ mapMaybe f $ modDataLayout m where
+  safeHead [x] = Just x
+  safeHead _ = Nothing
+
+  f (PointerSize 0 s _ _) = Just s
+  f _ = Nothing
+
+moduleTypeSizes :: Module -> Type -> Maybe Int
+moduleTypeSizes m = fmap (ceiling . (/ (8.0 :: Double)) . fromIntegral) . getTypeSizeInBits m
+
 -- | A memcpy is treated as an assignment if the number of bytes copied
 -- matches the size of the destination of the memcpy.  We strip bitcasts
 -- when checking this because the arguments to memcpy are void*, and
 -- that void types have no size.
-memcpyTransfer :: Module -> OutInfo -> Instruction -> Value -> Value -> Value -> Analysis OutInfo
-memcpyTransfer m info i dest src (valueContent -> ConstantC ConstantInt { constantIntValue = byteCount })
-  | TypePointer destBaseTy _ <- valueType (stripBitcasts dest)
+memcpyTransfer :: Module -> OutInfo -> Stmt -> Value -> Value -> Value -> Analysis OutInfo
+memcpyTransfer m info i dest src (valValue -> ValInteger byteCount)
+  | PtrTo destBaseTy <- valType (stripBitcasts dest)
   , Just tySize <- moduleTypeSizes m destBaseTy
   , tySize /= fromIntegral byteCount =
     case isArgument src of
@@ -352,7 +385,9 @@ memcpyTransfer m info i dest src (valueContent -> ConstantC ConstantInt { consta
       (Nothing, Just sarg) -> return $! merge outputInfo i sarg ArgIn info
       _ -> return info
   where
-    isArgument = fromValue . stripBitcasts
+    isArgument x = case valValue (stripBitcasts x) of
+                     ValIdent (IdentValArgument a) -> Just a
+                     _ -> Nothing
 memcpyTransfer _ info _ _ _ _ = return info
 
 -- | The transfer function encodes the following:
@@ -366,7 +401,7 @@ memcpyTransfer _ info _ _ _ _ = return info
 -- IN, then we do a join with the old value (if any).
 merge :: (Ord k)
          => Lens' info (Map k (ArgumentDirection, Set Witness)) -- ^ Param or field
-         -> Instruction -- ^ Instruction causing the merge
+         -> Stmt -- ^ Instruction causing the merge
          -> k -- ^ The base value (either a param or field owner)
          -> ArgumentDirection -- ^ New direction
          -> info -- ^ Old info
@@ -404,7 +439,7 @@ merge lns i arg ArgIn info =
         ArgIn -> info
         ArgBoth -> error "Foreign.Inference.Analysis.Output.merge(2): Infeasible path"
 -}
-    
+
 removeArrayPtr :: Argument -> OutInfo -> OutInfo
 removeArrayPtr a (OI oi foi) = OI (M.delete a oi) foi
 
@@ -439,27 +474,27 @@ outputSummaryToTestFormat (OutputSummary s sf _) =
     isOut (_, argDir) = argDir == ArgOut
 
     collectAggArgs (arg, fieldDirections) acc =
-      let func = argumentFunction arg
-          funcName = show (functionName func)
-          argName = show (argumentName arg)
+      let func = argDefine arg
+          funcName = prettySymbol (defName func)
+          an = argName arg
       in case argumentFieldCount arg of
         Nothing -> error ("Expected aggregate type in field direction summary " ++ show arg)
         Just fldCnt ->
           case length fieldDirections == fldCnt && all isOut fieldDirections of
             False -> acc
             True ->
-              let nv = S.singleton (argName, PAOut)
-              in M.insertWith' S.union funcName nv acc
+              let nv = S.singleton (an, PAOut)
+              in MS.insertWith S.union funcName nv acc
 
     collectArgs (arg, (dir, _)) acc =
-      let func = argumentFunction arg
-          funcName = show (functionName func)
-          argName = show (argumentName arg)
+      let func = argDefine arg
+          funcName = prettySymbol (defName func)
+          an = argName arg
       in case dirToAnnot dir of
         Nothing -> acc
         Just annot ->
-          let nv = S.singleton (argName, annot)
-          in M.insertWith' S.union funcName nv acc
+          let nv = S.singleton (an, annot)
+          in MS.insertWith S.union funcName nv acc
 
 {- Note [Pointers In Conditions]
 

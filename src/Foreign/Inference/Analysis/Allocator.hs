@@ -69,12 +69,15 @@ import Foreign.Inference.Internal.FlattenValue
 -- | The summary tracks the functions that return newly allocated values
 -- through their normal return value.  It also tracks the output parameters
 -- through which newly allocated values are returned.
-data SummaryType = ST { _summaryAllocatorFuncs :: Set Function
+data SummaryType = ST { _summaryAllocatorFuncs :: Set Define
                       , _summaryAllocatorArgs :: Set Argument
                       }
                       deriving (Generic, Eq, Show)
 
 $(makeLenses ''SummaryType)
+
+instance Semigroup SummaryType where
+  (<>) = mappend
 
 instance Monoid SummaryType where
   mempty = ST mempty mempty
@@ -91,6 +94,9 @@ $(makeLenses ''AllocatorSummary)
 
 instance Eq AllocatorSummary where
   (AllocatorSummary s1 _ _) == (AllocatorSummary s2 _ _) = s1 == s2
+
+instance Semigroup AllocatorSummary where
+  (<>) = mappend
 
 instance Monoid AllocatorSummary where
   mempty = AllocatorSummary mempty mempty mempty
@@ -126,8 +132,8 @@ data AllocatorData =
 -- point.  The escape analysis needs to be told to ignore this known and
 -- expected escape, so we track the responsibe instruction.
 data AllocatorInfo =
-  AI { _allocatorReturnValues :: Set (Value, Instruction)
-     , _allocatorOutValues :: Map Argument (Set (Maybe (Value, Instruction)))
+  AI { _allocatorReturnValues :: Set (Value, Stmt)
+     , _allocatorOutValues :: Map Argument (Set (Maybe (Value, Stmt)))
      }
      deriving (Eq, Show)
 
@@ -139,22 +145,22 @@ instance SummarizeModule AllocatorSummary where
   summarizeArgument a (AllocatorSummary (ST _ summ) _ finSumm)
     | not (S.member a summ) = []
     | otherwise =
-      case automaticFinalizersForType finSumm (valueType a) of
+      case automaticFinalizersForType finSumm (valType (toValue a)) of
         [] -> [(PAOutAlloc "free", [])]
-        [fin] -> [(PAOutAlloc (identifierAsString (functionName fin)), [])]
+        [fin] -> [(PAOutAlloc ((\(Symbol str) -> str) (defName fin)), [])]
         _ -> [(PAOutAlloc "", [])]
   summarizeFunction f (AllocatorSummary (ST summ _) _ finSumm)
     | not (S.member f summ) = []
     | otherwise =
-        case automaticFinalizersForType finSumm (functionReturnType f) of
+        case automaticFinalizersForType finSumm (defRetType f) of
           -- If there is no allocator, assume we just free it...  this
           -- isn't necessarily safe.
           [] -> [(FAAllocator "free", [])]
-          [fin] -> [(FAAllocator (identifierAsString (functionName fin)), [])]
+          [fin] -> [(FAAllocator ((\(Symbol str) -> str) (defName fin)), [])]
           -- There was more than one, can't guess
           _ -> [(FAAllocator "", [])]
 
-identifyAllocators :: forall compositeSummary funcLike . (FuncLike funcLike, HasFunction funcLike, HasCFG funcLike)
+identifyAllocators :: forall compositeSummary funcLike . (FuncLike funcLike, HasDefine funcLike, HasCFG funcLike)
                       => DependencySummary
                       -> IndirectCallSummary
                       -> Lens' compositeSummary AllocatorSummary
@@ -176,7 +182,7 @@ identifyAllocators ds ics lns escLens finLens outLens =
 
 -- | If any return slot (return value or output parameter) returns only
 -- non-escaping newly-allocated values, that return slot allocates.
-allocatorAnalysis :: (FuncLike funcLike, HasFunction funcLike, HasCFG funcLike)
+allocatorAnalysis :: (FuncLike funcLike, HasDefine funcLike, HasCFG funcLike)
                      => (EscapeSummary, (FinalizerSummary, OutputSummary))
                      -> funcLike
                      -> AllocatorSummary
@@ -188,7 +194,7 @@ allocatorAnalysis (esumm, (fsumm, outSumm)) funcLike s = do
   s'' <- checkReturnValues esumm f (S.toList rvs) s'
   foldM (checkArgValues esumm) s'' (M.toList argRets)
   where
-    f = getFunction funcLike
+    f = getDefine funcLike
     analysis = fwdDataflowAnalysis top meet (transfer s outSumm)
 
 top :: AllocatorInfo
@@ -210,25 +216,23 @@ meet (AI r1 a1) (AI r2 a2) =
 transfer :: AllocatorSummary
          -> OutputSummary
          -> AllocatorInfo
-         -> Instruction
+         -> Stmt
          -> Analysis AllocatorInfo
 transfer s outSumm ai i =
-  case i of
-    RetInst { retInstValue = Just rv }
-      | isPointerType (valueType rv) ->
+  case stmtInstr i of
+    Ret rv
+      | isPointerType (valType rv) ->
         let rvs = S.fromList (zip (flattenValue rv) (repeat i))
         in return $! ai & allocatorReturnValues %~ S.union rvs
       | otherwise -> return ai
-    StoreInst { storeAddress = (valueContent' -> ArgumentC arg)
-              , storeValue = (stripBitcasts -> sv)
-              }
+    Store (valValue . valueContent' -> ValIdent (IdentValArgument arg)) (stripBitcasts -> sv) _ _
       | isOutParam outSumm arg ->
         let rvs = S.fromList $ map Just (zip (flattenValue sv) (repeat i))
         in return $! ai & allocatorOutValues %~ M.insert arg rvs
       | otherwise -> return ai
-    CallInst { callFunction = cf, callArguments = (map fst -> args) } ->
+    Call _ _ cf args ->
       foldM (argumentTransfer s cf) ai (zip [0..] args)
-    InvokeInst { invokeFunction = cf, invokeArguments = (map fst -> args) } ->
+    Invoke _ cf args _ _ ->
       foldM (argumentTransfer s cf) ai (zip [0..] args)
     _ -> return ai
 
@@ -237,7 +241,7 @@ argumentTransfer :: AllocatorSummary
                  -> AllocatorInfo
                  -> (Int, Value)
                  -> Analysis AllocatorInfo
-argumentTransfer s cf ai (ix, (valueContent' -> ArgumentC a)) = do
+argumentTransfer s cf ai (ix, valValue . valueContent' -> ValIdent (IdentValArgument a)) = do
   summ <- lookupArgumentSummaryList s cf ix
   case any isOutAlloc summ of
     False -> return ai
@@ -252,7 +256,7 @@ isOutParam :: OutputSummary -> Argument -> Bool
 isOutParam s a = PAOut `elem` map fst (summarizeArgument a s)
 
 isPointerType :: Type -> Bool
-isPointerType (TypePointer _ _) = True
+isPointerType (PtrTo _) = True
 isPointerType _ = False
 
 -- | The set we are looking at has Maybes.  The 'Nothing' values indicate
@@ -261,7 +265,7 @@ isPointerType _ = False
 -- completely ignore them in the null check, though. 
 checkArgValues :: EscapeSummary
                -> AllocatorSummary
-               -> (Argument, Set (Maybe (Value, Instruction)))
+               -> (Argument, Set (Maybe (Value, Stmt)))
                -> Analysis AllocatorSummary
 checkArgValues esumm summ (a, S.toList -> rvs)
   | null nonNullRvs && not hasOutAlloc = return summ
@@ -284,8 +288,8 @@ checkArgValues esumm summ (a, S.toList -> rvs)
 -- then f is an allocator.  If there is a unique finalizer for the
 -- same type, associate it with this allocator.
 checkReturnValues :: EscapeSummary
-                  -> Function
-                  -> [(Value, Instruction)]
+                  -> Define
+                  -> [(Value, Stmt)]
                   -> AllocatorSummary
                   -> Analysis AllocatorSummary
 checkReturnValues esumm f rvs summ
@@ -309,24 +313,22 @@ checkReturnValues esumm f rvs summ
 -- allocator AND does not escape.
 isAllocatedWithoutEscape :: EscapeSummary
                          -> AllocatorSummary
-                         -> (Value, Instruction)
+                         -> (Value, Stmt)
                          -> Analysis Bool
 isAllocatedWithoutEscape esumm summ (rv, escInst) = do
-  allocatorInsts <- case valueContent' rv of
-    InstructionC i@CallInst { callFunction = f } ->
+  allocatorInsts <- case valValue (valueContent' rv) of
+    ValIdent (IdentValStmt i@(stmtInstr -> Call _ _ f _)) ->
       checkFunctionIsAllocator f summ [i]
-    InstructionC i@InvokeInst { invokeFunction = f } ->
+    ValIdent (IdentValStmt i@(stmtInstr -> Invoke _ f _ _ _)) ->
       checkFunctionIsAllocator f summ [i]
 
     -- Returning a sub-object using safe addressing.  This also works
     -- for some forms of pointer arithmetic that LLVM lowers into a
     -- GEP instruction.  Something more general could be added for
     -- uglier cases, but this seems like a good compromise.
-    InstructionC i@GetElementPtrInst { getElementPtrValue =
-      (valueContent' -> InstructionC base@CallInst { callFunction = f })} ->
+    ValIdent (IdentValStmt i@(stmtInstr -> GEP _ (valValue . valueContent' -> ValIdent (IdentValStmt base@(stmtInstr -> Call _ _ f _))) _)) ->
       checkFunctionIsAllocator f summ [i, base]
-    InstructionC i@GetElementPtrInst { getElementPtrValue =
-      (valueContent' -> InstructionC base@InvokeInst { invokeFunction = f })} ->
+    ValIdent (IdentValStmt i@(stmtInstr -> GEP _ (valValue . valueContent' -> ValIdent (IdentValStmt base@(stmtInstr -> Invoke _ f _ _ _))) _)) ->
       checkFunctionIsAllocator f summ [i, base]
 
     _ -> return []
@@ -336,10 +338,10 @@ isAllocatedWithoutEscape esumm summ (rv, escInst) = do
     True -> return False
     False -> return $! noneEscape esumm allocatorInsts escInst
 
-checkFunctionIsAllocator :: Value -> AllocatorSummary -> [Instruction] -> Analysis [Instruction]
+checkFunctionIsAllocator :: Value -> AllocatorSummary -> [Stmt] -> Analysis [Stmt]
 checkFunctionIsAllocator v summ is =
   case valueContent' v of
-    InstructionC LoadInst { } -> do
+    ValInstr Load {} -> do
       sis <- analysisEnvironment indirectCallSummary
       case indirectCallInitializers sis v of
         [] -> return []
@@ -351,7 +353,7 @@ checkFunctionIsAllocator v summ is =
         False -> return []
         True -> return is
 
-noneEscape :: EscapeSummary -> [Instruction] -> Instruction -> Bool
+noneEscape :: EscapeSummary -> [Stmt] -> Stmt -> Bool
 noneEscape escSumm is returnSlot =
   not (any (isJust . flip (escapeTest returnSlot) escSumm) is)
   where
@@ -365,14 +367,14 @@ isAllocatorAnnot _ = False
 
 isNotNull :: Value -> Bool
 isNotNull v =
-  case valueContent v of
-    ConstantC ConstantPointerNull {} -> False
+  case valValue v of
+    ValNull -> False
     _ -> True
 
 isNotPhi :: Value -> Bool
 isNotPhi v =
   case valueContent' v of
-    InstructionC PhiNode {} -> False
+    ValInstr Phi {} -> False
     _ -> True
 
 mayBeAlloc :: Value -> Bool
@@ -387,11 +389,11 @@ allocatorSummaryToTestFormat :: AllocatorSummary
 allocatorSummaryToTestFormat summ@(AllocatorSummary (ST fs args) _ _) =
   (fannots, argAnnots)
   where
-    fannots = M.fromList $ map ((show . functionName) &&& const Nothing) $ S.toList fs
+    fannots = M.fromList $ map ((prettySymbol . defName) &&& const Nothing) $ S.toList fs
     argAnnots = F.foldr toArgSumm mempty args
     toArgSumm a m =
-      let f = identifierAsString (functionName (argumentFunction a))
-          aname = identifierAsString (argumentName a)
+      let f = prettySymbol (defName (argDefine a))
+          aname = argName a
       in case summarizeArgument a summ of
         [(annot@(PAOutAlloc _), _)] ->
           M.insertWith S.union f (S.singleton (aname, annot)) m

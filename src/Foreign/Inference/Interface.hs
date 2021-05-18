@@ -66,7 +66,7 @@ import Control.DeepSeq
 import Control.Exception as E
 import Control.Monad ( liftM )
 import Control.Monad.Writer.Class ( MonadWriter )
-import Data.Aeson
+import Data.Aeson (decode', encode)
 import qualified Data.ByteString.Char8 as SBS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Data
@@ -89,17 +89,18 @@ import System.FilePath
 import System.IO.Error
 import Text.Jasmine
 
-import LLVM.Analysis
+import qualified LLVM.Analysis as LLVM
+import LLVM.Analysis hiding (Linkage)
 import LLVM.Analysis.AccessPath
 
 import Foreign.Inference.Diagnostics
 import Foreign.Inference.Interface.Metadata
 import Foreign.Inference.Interface.Types
 
-#if defined(RELOCATE)
-getStaticFiles :: IO (HashMap FilePath SBS.ByteString)
-getStaticFiles = return $ M.fromList $(embedDir "stdlibs")
-#else
+
+
+
+
 import Data.List ( stripPrefix )
 import Paths_foreign_inference
 
@@ -112,7 +113,7 @@ getStaticFiles = do
   dat <- getDir statDir
   let strip' p = fromMaybe p (stripPrefix "stdlibs/" p)
   return $ M.fromList (map (first strip') dat)
-#endif
+
 
 -- import Debug.Trace
 -- debug = flip trace
@@ -128,8 +129,8 @@ data InterfaceException = DependencyMissing FilePath
 instance Exception InterfaceException
 
 
-type ManualAnnotations = Map Text ([FuncAnnotation], IntMap [ParamAnnotation])
-type DepMap = HashMap Text ForeignFunction
+type ManualAnnotations = Map String ([FuncAnnotation], IntMap [ParamAnnotation])
+type DepMap = HashMap String ForeignFunction
 
 -- | This index is a map from struct fields containing ref-counting
 -- finalizers to the associated ref/unref functions.
@@ -151,9 +152,8 @@ data DependencySummary =
 isRefCountedObject :: DependencySummary -> Type -> Maybe (String, String)
 isRefCountedObject ds t =
   case t of
-    TypeStruct (Right _) _ _ -> do
-      let Just n = structTypeToName t
-      Map.lookup n (refCountSuperclasses ds)
+    Struct (Right (Ident n)) _ _ ->
+      Map.lookup (structBaseName n) (refCountSuperclasses ds)
     _ -> Nothing
 
 refCountFunctionsForField :: DependencySummary -> AbstractAccessPath -> Maybe (String, String)
@@ -213,7 +213,7 @@ data StdLib = CStdLib
 --
 -- WARNING: Don't put anything javascript-unsafe in the String.  This
 -- could be enforced but doesn't seem worth the effort right now.
-data Witness = Witness !Instruction String
+data Witness = Witness !Stmt String
              deriving (Eq, Ord, Show)
 
 instance NFData Witness where
@@ -227,7 +227,7 @@ data ModuleSummary = forall a . (SummarizeModule a) => ModuleSummary a
 -- constructs in 'Module's.
 class SummarizeModule s where
   summarizeArgument :: Argument -> s -> [(ParamAnnotation, [Witness])]
-  summarizeFunction :: Function -> s -> [(FuncAnnotation, [Witness])]
+  summarizeFunction :: Define -> s -> [(FuncAnnotation, [Witness])]
   -- | Annotate types.  The default implementation just returns the
   -- empty list
   summarizeType :: CType -> s -> [(TypeAnnotation, [Witness])]
@@ -352,7 +352,7 @@ loadTransDeps summaryDirs deps loadedDeps m = do
 mergeFunction :: DepMap -> ForeignFunction -> DepMap
 mergeFunction m f = case M.lookup fn m of
   Nothing -> M.insert fn f m
-  Just (ForeignFunction { foreignFunctionLinkage = LinkWeak }) -> M.insert fn f m
+  Just ForeignFunction { foreignFunctionLinkage = LinkWeak } -> M.insert fn f m
   Just f' -> case foreignFunctionLinkage f of
     LinkWeak -> m
     LinkDefault ->
@@ -361,7 +361,7 @@ mergeFunction m f = case M.lookup fn m of
         False ->
           $failure ("Functions with overlapping linkage: " ++ show f ++ " and " ++ show f')
   where
-    fn = T.pack $ foreignFunctionName f
+    fn = foreignFunctionName f
 
 -- | This is a low-level helper to load a LibraryInterface from a
 -- location on disk.
@@ -418,56 +418,56 @@ moduleToLibraryInterface m name deps summaries annots =
                    }
   where
     ts = moduleInterfaceStructTypes m
-    funcs = mapMaybe (functionToExternal summaries annots) (moduleDefinedFunctions m)
-    aliases = mapMaybe (functionAliasToExternal summaries annots) (moduleAliases m)
+    funcs = mapMaybe (functionToExternal summaries annots) (modDefines m)
+    aliases = mapMaybe (functionAliasToExternal summaries annots) (modAliases m)
     annotateType t = concatMap (map fst . summarizeType t) summaries
 
 
 functionAliasToExternal :: [ModuleSummary] -> ManualAnnotations -> GlobalAlias -> Maybe ForeignFunction
 functionAliasToExternal summaries annots a =
-  case valueContent' (globalAliasTarget a) of
-    FunctionC f -> do
+  case valValue (valueContent' (aliasTarget a)) of
+    ValSymbol (SymValDefine f) -> do
       -- Copy the visibility of the alias to the function.  It is often the case
       -- that an alias will be publically visible but the aliasee is not.  This way,
       -- we can fully re-use functionToExternal
-      let f' = f { functionVisibility = globalAliasVisibility a }
+      let f' = f { defVisibility = aliasVisibility a }
       e <- functionToExternal summaries annots f'
-      return e { foreignFunctionName = identifierAsString (globalAliasName a) }
+      return e { foreignFunctionName = (\(Symbol str) -> str) (aliasName a) }
     _ -> Nothing
 
 
 -- | Summarize a single function.  Functions with types in their
 -- signatures that have certain exotic types are not supported in
 -- interfaces.
-functionToExternal :: [ModuleSummary] -> ManualAnnotations -> Function -> Maybe ForeignFunction
+functionToExternal :: [ModuleSummary] -> ManualAnnotations -> Define -> Maybe ForeignFunction
 functionToExternal summaries annots f =
   case vis of
-    VisibilityHidden -> Nothing
+    Just HiddenVisibility -> Nothing
     _ -> do
-      lnk <- toLinkage (functionLinkage f)
+      lnk <- toLinkage (fromMaybe LLVM.External (defLinkage f))
       fretty <- typeToCType (functionReturnMetaUnsigned f) fretType
-      let indexedArgs = zip [0..] (functionParameters f)
+      let indexedArgs = zip [0..] (defArgs f)
       params <- mapM (paramToExternal summaries annots) indexedArgs
-      return ForeignFunction { foreignFunctionName = identifierAsString (functionName f)
+      return ForeignFunction { foreignFunctionName = (\(Symbol str) -> str) (defName f)
                              , foreignFunctionLinkage =
-                                  if vis == VisibilityProtected then LinkWeak else lnk
+                                  if vis == Just ProtectedVisibility then LinkWeak else lnk
                              , foreignFunctionReturnType = fretty
                              , foreignFunctionParameters = params
                              , foreignFunctionAnnotations = fannots
                              }
   where
-    vis = functionVisibility f
+    vis = defVisibility f
     fannots = userFunctionAnnotations annots f ++
                 concatMap (map fst . summarizeFunction f) summaries
-    fretType = case functionType f of
-      TypeFunction rt _ _ -> rt
+    fretType = case getType f of
+      FunTy rt _ _ -> rt
       t -> t
 
 paramToExternal :: [ModuleSummary] -> ManualAnnotations -> (Int, Argument) -> Maybe Parameter
 paramToExternal summaries annots (ix, arg) = do
-  ptype <- typeToCType (paramMetaUnsigned arg) (argumentType arg)
+  ptype <- typeToCType (paramMetaUnsigned arg) (argType arg)
   return Parameter { parameterType = ptype
-                   , parameterName = identifierAsString (argumentName arg)
+                   , parameterName = argName arg
                    , parameterAnnotations =
                      userParameterAnnotations annots f ix ++
                               -- The map fst here drops witness information -
@@ -475,30 +475,30 @@ paramToExternal summaries annots (ix, arg) = do
                        concatMap (map fst . summarizeArgument arg) summaries
                    }
   where
-    f = argumentFunction arg
+    f = argDefine arg
 
-isVarArg :: ExternalFunction -> Bool
+isVarArg :: Declare -> Bool
 isVarArg ef = isVa
   where
-    (TypeFunction _ _ isVa) = externalFunctionType ef
+    (FunTy _ _ isVa) = getType ef
 
-userFunctionAnnotations :: ManualAnnotations -> Function -> [FuncAnnotation]
+userFunctionAnnotations :: ManualAnnotations -> Define -> [FuncAnnotation]
 userFunctionAnnotations allAnnots f =
   case fannots of
     Nothing -> []
     Just (fas, _) -> fas
   where
-    fname = identifierContent $ functionName f
+    Symbol fname = defName f
     fannots = Map.lookup fname allAnnots
 
-userParameterAnnotations :: ManualAnnotations -> Function -> Int -> [ParamAnnotation]
+userParameterAnnotations :: ManualAnnotations -> Define -> Int -> [ParamAnnotation]
 userParameterAnnotations allAnnots f ix =
   case fannots of
     Nothing -> []
     Just (_, pmap) -> IM.findWithDefault [] ix pmap
 
   where
-    fname = identifierContent $ functionName f
+    Symbol fname = defName f
     fannots = Map.lookup fname allAnnots
 
 class (Monad m) => HasDependencies m where
@@ -512,12 +512,12 @@ lookupFunctionSummary :: (Show v, IsValue v,
                          -> m (Maybe [FuncAnnotation])
 lookupFunctionSummary ms val = do
   ds <- getDependencySummary
-  case valueContent' val of
-    FunctionC f ->
+  case valValue (valueContent' val) of
+    ValSymbol (SymValDefine f) ->
       let fannots = userFunctionAnnotations (manualAnnotations ds) f
       in return $! Just $ fannots ++ map fst (summarizeFunction f ms)
-    ExternalFunctionC ef -> do
-      let fname = identifierContent $ externalFunctionName ef
+    ValSymbol (SymValDeclare ef) -> do
+      let Symbol fname = decName ef
           summ = depSummary ds
           extract = return . Just . foreignFunctionAnnotations
       maybe (missingDependency ef) extract (M.lookup fname summ)
@@ -534,7 +534,7 @@ lookupFunctionSummaryList :: (Show v, IsValue v,
                              -> v
                              -> m [FuncAnnotation]
 lookupFunctionSummaryList ms val =
-  liftM (fromMaybe []) $ lookupFunctionSummary ms val
+  fromMaybe [] <$> lookupFunctionSummary ms val
 
 lookupArgumentSummary :: (Show v, IsValue v,
                           SummarizeModule s, HasDependencies m,
@@ -545,16 +545,16 @@ lookupArgumentSummary :: (Show v, IsValue v,
                          -> m (Maybe [ParamAnnotation])
 lookupArgumentSummary ms val ix = do
   ds <- getDependencySummary
-  case valueContent' val of
-    FunctionC f ->
-      case ix < length (functionParameters f) of
+  case valValue (valueContent' val) of
+    ValSymbol (SymValDefine f) ->
+      case ix < length (defArgs f) of
         False -> return (Just [])
         True ->
-          let annots = summarizeArgument (functionParameters f !! ix) ms
+          let annots = summarizeArgument (defArgs f !! ix) ms
               uannots = userParameterAnnotations (manualAnnotations ds) f ix
           in return $! Just $ uannots ++ map fst annots
-    ExternalFunctionC ef -> do
-      let fname = identifierContent $ externalFunctionName ef
+    ValSymbol (SymValDeclare ef) -> do
+      let Symbol fname = decName ef
           summ = depSummary ds
           -- Either this was a vararg or the function was cast to a
           -- strange type (with extra parameters) before being called.
@@ -578,7 +578,7 @@ lookupArgumentSummaryList :: (Show v, IsValue v,
                              -> Int
                              -> m [ParamAnnotation]
 lookupArgumentSummaryList ms val ix =
-  liftM (fromMaybe []) $ lookupArgumentSummary ms val ix
+  fromMaybe [] <$> lookupArgumentSummary ms val ix
 
 notAFunction :: (Show v, MonadWriter Diagnostics m) => v -> m (Maybe a)
 notAFunction _ = -- do
@@ -595,63 +595,75 @@ missingDependency callee = do
 
 -- Helpers
 
--- | FIXME: Need to consult some metadata here to get sign information
---
--- Convert an LLVM type to an external type.  Note that some types are
+-- TODO: Need to consult some metadata here to get sign information
+functionReturnMetaUnsigned :: Define -> Bool
+functionReturnMetaUnsigned _ = False
+
+-- | Convert an LLVM type to an external type.  Note that some types are
 -- not supported in external interfaces (vectors and exotic floating
 -- point types).
 typeToCType :: Bool -> Type -> Maybe CType
 typeToCType isUnsigned t = case t of
-  TypeVoid -> return CVoid
-  TypeInteger i ->
-    case isUnsigned of
-      False -> return $! CInt i
-      True -> return $! CUInt i
-  TypeFloat -> return CFloat
-  TypeDouble -> return CDouble
-  TypeArray _ t' -> do
+  Array _ t' -> do
     tt <- typeToCType isUnsigned t'
     return $! CPointer tt
-  TypeFunction r ts _ -> do
+  FunTy r ts _ -> do
     rt <- typeToCType False r
     tts <- mapM (typeToCType False) ts
     return $! CFunction rt tts
-  TypePointer t' _ -> do
+  PtrTo t' -> do
     tt <- typeToCType False t'
     return $! CPointer tt
-  TypeStruct (Right n) _ _ -> return $! CStruct (sanitizeStructName n) []
-  TypeStruct (Left _) ts _ -> do
+  Struct (Right (Ident n)) _ _ -> return $! CStruct (sanitizeStructName n) []
+  Struct (Left _) ts _ -> do
     tts <- mapM (typeToCType False) ts
     return $! CAnonStruct tts
-  TypeFP128 -> Nothing
-  TypeX86FP80 -> Nothing
-  TypePPCFP128 -> Nothing
-  TypeX86MMX -> Nothing
-  TypeLabel -> Nothing
-  TypeMetadata -> Nothing
-  TypeVector _ _ -> Nothing
+  Vector _ _ -> Nothing
+  Opaque _ -> Nothing
+  PrimType p -> primtypeToCType isUnsigned p
+
+primtypeToCType :: Bool -> PrimType -> Maybe CType
+primtypeToCType isUnsigned t = case t of
+  Void -> return CVoid
+  Label -> Nothing
+  Metadata -> Nothing
+  Integer i ->
+    case isUnsigned of
+      False -> return $! CInt (fromIntegral i)
+      True -> return $! CUInt (fromIntegral i)
+  FloatType f -> floatTypeToCType f
+  X86mmx -> Nothing
+
+floatTypeToCType :: FloatType -> Maybe CType
+floatTypeToCType t = case t of
+  Float -> return CFloat
+  Double -> return CDouble
+  Fp128 -> Nothing
+  X86_fp80 -> Nothing
+  PPC_fp128 -> Nothing
+  Half -> Nothing
 
 -- | Convert an LLVM linkage to a type more suitable for the summary
 -- If this function returns a Linkage, the function is exported in the
 -- shared library interface.  Private (internal linkage) functions are
 -- not exported and therefore not shown in the interface.
-toLinkage :: LinkageType -> Maybe Linkage
+toLinkage :: LLVM.Linkage -> Maybe Linkage
 toLinkage l = case l of
-  LTExternal -> Just LinkDefault
-  LTAvailableExternally -> Just LinkDefault
-  LTLinkOnceAny -> Just LinkWeak
-  LTLinkOnceODR -> Just LinkWeak
-  LTAppending -> Just LinkDefault
-  LTInternal -> Nothing
-  LTPrivate -> Nothing
-  LTLinkerPrivate -> Nothing
-  LTLinkerPrivateWeak -> Nothing
-  LTLinkerPrivateWeakDefAuto -> Nothing
-  LTDLLImport -> Just LinkDefault
-  LTDLLExport -> Just LinkDefault
-  LTExternalWeak -> Just LinkWeak
-  LTCommon -> Just LinkDefault
-  LTWeakAny -> Just LinkWeak
-  LTWeakODR -> Just LinkWeak
+  LLVM.Private -> Nothing
+  LLVM.LinkerPrivate -> Nothing
+  LLVM.LinkerPrivateWeak -> Nothing
+  LLVM.LinkerPrivateWeakDefAuto -> Nothing
+  LLVM.Internal -> Nothing
+  LLVM.AvailableExternally -> Just LinkDefault
+  LLVM.Linkonce -> Just LinkWeak
+  LLVM.Weak -> Just LinkWeak
+  LLVM.Common -> Just LinkDefault
+  LLVM.Appending -> Just LinkDefault
+  LLVM.ExternWeak -> Just LinkWeak
+  LLVM.LinkonceODR -> Just LinkWeak
+  LLVM.WeakODR -> Just LinkWeak
+  LLVM.External -> Just LinkDefault
+  LLVM.DLLImport -> Just LinkDefault
+  LLVM.DLLExport -> Just LinkDefault
 
 {-# ANN module "HLint: ignore Use if" #-}

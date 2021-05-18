@@ -1,5 +1,5 @@
 {-# LANGUAGE TemplateHaskell, RankNTypes, ScopedTypeVariables #-}
-{-# LANGUAGE ViewPatterns, DeriveGeneric #-}
+{-# LANGUAGE ViewPatterns, DeriveGeneric, FlexibleContexts #-}
 -- | This analysis identifies the addRef and decRef functions for a library,
 -- along with the set of types that is reference counted.  This analysis is
 -- unsound and incomplete, but still useful.
@@ -100,7 +100,7 @@ instance NFData UnrefData where
 
 -- | Summary information for the reference counting analysis
 data RefCountSummary =
-  RefCountSummary { _conditionalFinalizers :: HashSet Function
+  RefCountSummary { _conditionalFinalizers :: HashSet Define
                   , _unrefArguments :: HashMap Argument UnrefData
                   , _refArguments :: HashMap Argument (AbstractAccessPath, [Witness])
                   , _refCountedTypes :: HashMap (String, String) (HashSet Type)
@@ -109,6 +109,9 @@ data RefCountSummary =
   deriving (Generic)
 
 $(makeLenses ''RefCountSummary)
+
+instance Semigroup RefCountSummary where
+  (<>) = mappend
 
 instance Monoid RefCountSummary where
   mempty = RefCountSummary mempty mempty mempty mempty mempty
@@ -148,15 +151,15 @@ instance SummarizeModule RefCountSummary where
         case HM.lookup a refArgs of
           Nothing -> []
           Just (fieldPath, ws) ->
-            case matchingTypeAndPath (argumentType a) fieldPath unrefCountAccessPath unrefArgs of
+            case matchingTypeAndPath (argType a) fieldPath unrefCountAccessPath unrefArgs of
               Nothing -> [(PAAddRef "", ws)]
               Just fname -> [(PAAddRef fname, ws)]
       Just (UnrefData fieldPath fptrPaths ws) ->
-        case matchingTypeAndPath (argumentType a) fieldPath fst refArgs of
+        case matchingTypeAndPath (argType a) fieldPath fst refArgs of
           Nothing -> [(PAUnref "" (mapMaybe externalizeAccessPath fptrPaths) [], ws)]
           Just fname ->
-            let unrefFunc = argumentFunction a
-                unrefName = identifierAsString (functionName unrefFunc)
+            let unrefFunc = argDefine a
+                unrefName = (\(Symbol str) -> str) (defName unrefFunc)
                 ssts = HS.toList $ argumentCastedTypes a
                 structuralSupertypes = mapMaybe (structTypeToName . stripPointerTypes) ssts
             in [(PAUnref fname (mapMaybe externalizeAccessPath fptrPaths) structuralSupertypes, ws)]
@@ -180,17 +183,17 @@ matchingTypeAndPath :: Type
 matchingTypeAndPath t accPath toPath m =
   case filter matchingPair pairs of
     [(singleMatch, _)] ->
-      let f = argumentFunction singleMatch
-      in Just $ identifierAsString (functionName f)
+      let f = argDefine singleMatch
+      in Just $ (\(Symbol str) -> str) (defName f)
     _ -> Nothing
   where
     pairs = HM.toList m
-    matchingPair (arg, d) = argumentType arg == t && (toPath d) == accPath
+    matchingPair (arg, d) = argType arg == t && (toPath d) == accPath
 
 type Analysis = AnalysisMonad () ()
 
 -- | The main analysis to identify both incref and decref functions.
-identifyRefCounting :: forall compositeSummary funcLike . (FuncLike funcLike, HasFunction funcLike, HasCFG funcLike)
+identifyRefCounting :: forall compositeSummary funcLike . (FuncLike funcLike, HasDefine funcLike, HasCFG funcLike)
                        => DependencySummary
                        -> Lens' compositeSummary RefCountSummary
                        -> Getter compositeSummary FinalizerSummary
@@ -211,8 +214,8 @@ identifyRefCounting ds lns depLens1 depLens2 =
 --
 -- Note that no finalizer is allowed to be a conditional finalizer
 isConditionalFinalizer :: FinalizerSummary
-                          -> Function
-                          -> Analysis (Maybe (Instruction, Argument))
+                          -> Define
+                          -> Analysis (Maybe (Stmt, Argument))
 isConditionalFinalizer summ f = do
   fin <- functionIsFinalizer summ f
   case fin of
@@ -220,9 +223,9 @@ isConditionalFinalizer summ f = do
     False -> do
       -- Find the list of all arguments that are finalized in the
       -- function.
-      finArgs <- mapM (isFinalizerCall summ) (functionInstructions f)
+      finArgs <- mapM (isFinalizerCall summ) (defStmts f)
       case catMaybes finArgs of
---      case mapMaybe (isFinalizerCall summ) (functionInstructions f) of
+--      case mapMaybe (isFinalizerCall summ) (defStmts f) of
         [] -> return Nothing
         -- If there is more than one match, ensure that they all
         -- finalize the same argument.  If that is not the case,
@@ -233,24 +236,22 @@ isConditionalFinalizer summ f = do
             True -> return (Just x)
 
 isFinalizerCall :: FinalizerSummary
-                   -> Instruction
-                   -> Analysis (Maybe (Instruction, Argument))
+                   -> Stmt
+                   -> Analysis (Maybe (Stmt, Argument))
 isFinalizerCall summ i =
-  case i of
-    CallInst { callFunction = callee, callArguments = args } ->
-      callFinalizes summ i callee (map fst args)
-    InvokeInst { invokeFunction = callee, invokeArguments = args } ->
-      callFinalizes summ i callee (map fst args)
+  case stmtInstr i of
+    Call _ _ callee args -> callFinalizes summ i callee args
+    Invoke _ callee args _ _ -> callFinalizes summ i callee args
     _ -> return Nothing
 
 -- | If the given call (value + args) is a finalizer, return the
 -- Argument it is finalizing.  If it is a finalizer but does not
 -- finalize an argument, returns Nothing.
 callFinalizes :: FinalizerSummary
-                 -> Instruction
+                 -> Stmt
                  -> Value -- ^ The called value
                  -> [Value] -- ^ Actual arguments
-                 -> Analysis (Maybe (Instruction, Argument))
+                 -> Analysis (Maybe (Stmt, Argument))
 callFinalizes fs i callee args = do
   finArgs <- mapM isFinalizedArgument (zip [0..] args)
   case catMaybes finArgs of
@@ -259,22 +260,22 @@ callFinalizes fs i callee args = do
   where
     isFinalizedArgument (ix, arg) = do
       annots <- lookupArgumentSummaryList fs callee ix
-      case (PAFinalize `elem` annots, valueContent' arg) of
+      case (PAFinalize `elem` annots, valValue (valueContent' arg)) of
         (False, _) -> return Nothing
         -- We only return a hit if this is an Argument to the *caller*
         -- that is being finalized
-        (True, ArgumentC a) -> return (Just a)
+        (True, ValIdent (IdentValArgument a)) -> return (Just a)
         (True, _) -> return Nothing
 
-functionIsFinalizer :: FinalizerSummary -> Function -> Analysis Bool
+functionIsFinalizer :: FinalizerSummary -> Define -> Analysis Bool
 functionIsFinalizer fs f = do
   allArgAnnots <- mapM (lookupArgumentSummaryList fs f) [0..maxArg]
   return $ any argFinalizes allArgAnnots
   where
-    maxArg = length (functionParameters f) - 1
+    maxArg = length (defArgs f) - 1
     argFinalizes annots = PAFinalize `elem` annots
 
-refCountAnalysis :: (FuncLike funcLike, HasCFG funcLike, HasFunction funcLike)
+refCountAnalysis :: (FuncLike funcLike, HasCFG funcLike, HasDefine funcLike)
                     => (FinalizerSummary, ScalarEffectSummary)
                     -> funcLike
                     -> RefCountSummary
@@ -291,10 +292,10 @@ refCountAnalysis (finSumm, seSumm) funcLike summ = do
     Just (cfi, cfa) ->
       let summWithCondFin = (conditionalFinalizers %~ HS.insert f) summ''
           finWitness = Witness cfi "condfin"
-          fptrAccessPaths = mapMaybe (indirectCallAccessPath cfa) (functionInstructions f)
+          fptrAccessPaths = mapMaybe (indirectCallAccessPath cfa) (defStmts f)
           -- If this is a conditional finalizer, figure out which
           -- field (if any) is unrefed.
-          newUnref = case (decRefCountFields seSumm f, functionParameters f) of
+          newUnref = case (decRefCountFields seSumm f, defArgs f) of
             ([(accPath, decWitness)], [a]) ->
               let ud = UnrefData accPath fptrAccessPaths [finWitness, decWitness]
               in HM.insert a ud
@@ -302,21 +303,21 @@ refCountAnalysis (finSumm, seSumm) funcLike summ = do
           summWithUnref = (unrefArguments %~ newUnref) summWithCondFin
       in return summWithUnref
   where
-    f = getFunction funcLike
+    f = getDefine funcLike
 
-refCountTypes :: Function -> Analysis (HashMap (String, String) (HashSet Type))
+refCountTypes :: Define -> Analysis (HashMap (String, String) (HashSet Type))
 refCountTypes f = do
   ds <- getDependencySummary
-  let fptrFuncs = mapMaybe (identifyIndicatorFields ds) (functionInstructions f)
-      rcTypesByField = map (id *** unaryFuncToCastedArgTypes) fptrFuncs
+  let fptrFuncs = mapMaybe (identifyIndicatorFields ds) (defStmts f)
+      rcTypesByField = map (second unaryFuncToCastedArgTypes) fptrFuncs
       structuralRefTypes = mapMaybe (subtypeRefCountTypes ds) interfaceTypes
       rcTypes = rcTypesByField ++ structuralRefTypes
   return $ foldr (\(k, v) m -> HM.insertWith HS.union k v m) mempty rcTypes
   where
-    interfaceTypes = functionReturnType f : map argumentType (functionParameters f)
+    interfaceTypes = defRetType f : map argType (defArgs f)
     identifyIndicatorFields ds i =
-      case i of
-        StoreInst { storeValue = (valueContent' -> FunctionC sv) } ->
+      case stmtInstr i of
+        Store (valValue . valueContent' -> ValSymbol (SymValDefine sv)) _ _ _ ->
           case accessPath i of
             Nothing -> Nothing
             Just cAccPath -> do
@@ -332,7 +333,7 @@ subtypeRefCountTypes ds t0 = go t1
   where
     t1 = stripPointerTypes t0
     go t = case t of
-      TypeStruct _ (structuralParent:_) _ -> do
+      Struct _ (structuralParent:_) _ -> do
         -- If this type is known to be ref counted, just return.
         -- Otherwise, check if any structural parents of this type are
         -- known to be ref counted.  We check this by considering the
@@ -342,7 +343,7 @@ subtypeRefCountTypes ds t0 = go t1
         case isRefCountedObject ds t of
           Just rcFuncs -> return (rcFuncs, HS.singleton t1)
           Nothing -> go structuralParent
-      TypeStruct _ _ _ -> do
+      Struct _ _ _ -> do
         rcFuncs <- isRefCountedObject ds t
         return (rcFuncs, HS.singleton t1)
       _ -> Nothing
@@ -351,31 +352,31 @@ subtypeRefCountTypes ds t0 = go t1
 -- | If the function is unary, return a set with the type of that
 -- argument along with all of the types it is casted to in the body of
 -- the function
-unaryFuncToCastedArgTypes :: Function -> HashSet Type
+unaryFuncToCastedArgTypes :: Define -> HashSet Type
 unaryFuncToCastedArgTypes f =
-  case functionParameters f of
+  case defArgs f of
     [p] -> argumentCastedTypes p
     _ -> mempty
 
 argumentCastedTypes :: Argument -> HashSet Type
 argumentCastedTypes a =
-  fst $ foldr captureCastedType s0 (functionInstructions f)
+  fst $ foldr captureCastedType s0 (defStmts f)
   where
-    f = argumentFunction a
-    s0 = (HS.singleton (argumentType a), HS.singleton (toValue a))
+    f = argDefine a
+    s0 = (HS.singleton (argType a), HS.singleton (toValue a))
 
     captureCastedType i acc@(ts, vs) =
-      case i of
-        BitcastInst { castedValue = cv } ->
+      case stmtInstr i of
+        Conv BitCast cv _ ->
           case cv `HS.member` vs of
             False -> acc
-            True -> (HS.insert (valueType i) ts, HS.insert (toValue i) vs)
+            True -> (HS.insert (valType (toValue i)) ts, HS.insert (toValue i) vs)
         _ -> acc
 
 
-incRefAnalysis :: ScalarEffectSummary -> Function -> RefCountSummary -> RefCountSummary
+incRefAnalysis :: ScalarEffectSummary -> Define -> RefCountSummary -> RefCountSummary
 incRefAnalysis seSumm f summ =
-  case (incRefCountFields seSumm f, functionParameters f) of
+  case (incRefCountFields seSumm f, defArgs f) of
     ([], _) -> summ
     ([(fieldPath, w)], [a]) ->
       let newAddRef = HM.insert a (fieldPath, [w]) (summ ^. refArguments)
@@ -388,13 +389,11 @@ incRefAnalysis seSumm f summ =
 
 -- | If the instruction is an indirect function call, return the
 -- *concrete* AccessPath from which the function pointer was obtained.
-indirectCallAccessPath :: Argument -> Instruction -> Maybe AbstractAccessPath
+indirectCallAccessPath :: Argument -> Stmt -> Maybe AbstractAccessPath
 indirectCallAccessPath arg i =
-  case i of
-    CallInst { callFunction = f, callArguments = actuals } ->
-      notDirect f (map fst actuals)
-    InvokeInst { invokeFunction = f, invokeArguments = actuals } ->
-      notDirect f (map fst actuals)
+  case stmtInstr i of
+    Call _ _ f actuals -> notDirect f actuals
+    Invoke _ f actuals _ _ -> notDirect f actuals
     _ -> Nothing
   where
     -- The only indirect calls occur through a load instruction.
@@ -406,32 +405,32 @@ indirectCallAccessPath arg i =
     -- finalized.  This is a kind of backwards reachability from the
     -- base of the access path
     notDirect v actuals =
-      case (any (isSameArg arg) actuals, valueContent' v) of
-        (True, InstructionC callee@LoadInst {}) -> do
+      case (any (isSameArg arg) actuals, valValue (valueContent' v)) of
+        (True, ValIdent (IdentValStmt callee@(stmtInstr -> Load {}))) -> do
           accPath <- accessPath callee
           return $! abstractAccessPath accPath
         _ -> Nothing
 
 isSameArg :: Argument -> Value -> Bool
 isSameArg arg v =
-  case valueContent' v of
-    ArgumentC a -> arg == a
+  case valValue (valueContent' v) of
+    ValIdent (IdentValArgument a) -> arg == a
     _ -> False
 
 -- FIXME: Equality with arg isn't enough because of bitcasts
 
 -- | Find all of the fields of argument objects that are decremented
 -- in the given Function, returning the affected AbstractAccessPaths
-decRefCountFields :: ScalarEffectSummary -> Function -> [(AbstractAccessPath, Witness)]
+decRefCountFields :: ScalarEffectSummary -> Define -> [(AbstractAccessPath, Witness)]
 decRefCountFields seSumm f = mapMaybe (checkDecRefCount seSumm) allInsts
   where
-    allInsts = concatMap basicBlockInstructions (functionBody f)
+    allInsts = concatMap bbStmts (defBody f)
 
 -- | Likewise, but for incremented fields
-incRefCountFields :: ScalarEffectSummary -> Function -> [(AbstractAccessPath, Witness)]
+incRefCountFields :: ScalarEffectSummary -> Define -> [(AbstractAccessPath, Witness)]
 incRefCountFields seSumm f = mapMaybe (checkIncRefCount seSumm) allInsts
   where
-    allInsts = concatMap basicBlockInstructions (functionBody f)
+    allInsts = concatMap bbStmts (defBody f)
 
 -- | This function checks whether or not the given 'Instruction'
 -- decrements a reference count (really, any integer field embedded in
@@ -440,87 +439,59 @@ incRefCountFields seSumm f = mapMaybe (checkIncRefCount seSumm) allInsts
 --
 -- FIXME: Add support for cmpxchg?
 checkDecRefCount :: ScalarEffectSummary
-                    -> Instruction
+                    -> Stmt
                     -> Maybe (AbstractAccessPath, Witness)
 checkDecRefCount seSumm i = do
-  p <- case i of
-    AtomicRMWInst { atomicRMWOperation = AOSub
-                  , atomicRMWValue = (valueContent ->
-      ConstantC ConstantInt { constantIntValue = 1 })} ->
+  p <- case stmtInstr i of
+    AtomicRW _ AtomicSub _ (valValue -> ValInteger 1) _ _ ->
       absPathIfArg i
-    AtomicRMWInst { atomicRMWOperation = AOAdd
-                  , atomicRMWValue =
-      (valueContent -> ConstantC ConstantInt { constantIntValue = -1 })} ->
+    AtomicRW _ AtomicAdd _ (valValue -> ValInteger (-1)) _ _ ->
       absPathIfArg i
-    StoreInst { storeValue = (valueContent' ->
-      InstructionC SubInst { binaryRhs = (valueContent' ->
-        ConstantC ConstantInt { constantIntValue = 1 })
-                           , binaryLhs = (valueContent' ->
-        InstructionC oldRefCount) })} ->
+    Store _ (valueContent' -> ValInstr (Arith Sub {}
+        (valValue . valueContent' -> ValIdent (IdentValStmt oldRefCount))
+        (valValue . valueContent' -> ValInteger 1))) _ _ ->
       absPathIfArg oldRefCount
-    StoreInst { storeValue = (valueContent' ->
-      InstructionC AddInst { binaryRhs = (valueContent' ->
-        ConstantC ConstantInt { constantIntValue = -1 })
-                           , binaryLhs = (valueContent' ->
-        InstructionC oldRefCount) })} ->
+    Store _ (valueContent' -> ValInstr (Arith Add {}
+        (valValue . valueContent' -> ValIdent (IdentValStmt oldRefCount))
+        (valValue . valueContent' -> ValInteger (-1)))) _ _ ->
       absPathIfArg oldRefCount
-    StoreInst { storeValue = (valueContent' ->
-      InstructionC AddInst { binaryLhs = (valueContent' ->
-        ConstantC ConstantInt { constantIntValue = -1 })
-                           , binaryRhs = (valueContent' ->
-        InstructionC oldRefCount) })} ->
+    Store _ (valueContent' -> ValInstr (Arith Add {}
+        (valValue . valueContent' -> ValInteger (-1))
+        (valValue . valueContent' -> ValIdent (IdentValStmt oldRefCount)))) _ _ ->
       absPathIfArg oldRefCount
-    CallInst { callFunction = (valueContent' -> FunctionC f)
-             , callArguments = [(a,_)]
-             } ->
-      absPathThroughCall seSumm scalarEffectSubOne (functionParameters f) a
-    InvokeInst { invokeFunction = (valueContent' -> FunctionC f)
-               , invokeArguments = [(a,_)]
-               } ->
-      absPathThroughCall seSumm scalarEffectSubOne (functionParameters f) a
+    Call _ _ (valValue . valueContent' -> ValSymbol (SymValDefine f)) [a] ->
+      absPathThroughCall seSumm scalarEffectSubOne (defArgs f) a
+    Invoke _ (valValue . valueContent' -> ValSymbol (SymValDefine f)) [a] _ _ ->
+      absPathThroughCall seSumm scalarEffectSubOne (defArgs f) a
     _ -> Nothing
   return (p, Witness i "decr")
 
 -- | Analogous to 'checkDecRefCount', but for increments
 checkIncRefCount :: ScalarEffectSummary
-                    -> Instruction
+                    -> Stmt
                     -> Maybe (AbstractAccessPath, Witness)
 checkIncRefCount seSumm i = do
-  p <- case i of
-    AtomicRMWInst { atomicRMWOperation = AOAdd
-                  , atomicRMWValue = (valueContent ->
-      ConstantC ConstantInt { constantIntValue = 1 })} ->
+  p <- case stmtInstr i of
+    AtomicRW _ AtomicSub _ (valValue -> ValInteger (-1)) _ _ ->
       absPathIfArg i
-    AtomicRMWInst { atomicRMWOperation = AOSub
-                  , atomicRMWValue =
-      (valueContent -> ConstantC ConstantInt { constantIntValue = -1 })} ->
+    AtomicRW _ AtomicAdd _ (valValue -> ValInteger 1) _ _ ->
       absPathIfArg i
-    StoreInst { storeValue = (valueContent' ->
-      InstructionC SubInst { binaryRhs = (valueContent' ->
-        ConstantC ConstantInt { constantIntValue = -1 })
-                           , binaryLhs = (valueContent' ->
-        InstructionC oldRefCount) })} ->
+    Store _ (valueContent' -> ValInstr (Arith Sub {}
+        (valValue . valueContent' -> ValIdent (IdentValStmt oldRefCount))
+        (valValue . valueContent' -> ValInteger (-1)))) _ _ ->
       absPathIfArg oldRefCount
-    StoreInst { storeValue = (valueContent' ->
-      InstructionC AddInst { binaryRhs = (valueContent' ->
-        ConstantC ConstantInt { constantIntValue = 1 })
-                           , binaryLhs = (valueContent' ->
-        InstructionC oldRefCount) })} ->
+    Store _ (valueContent' -> ValInstr (Arith Add {}
+        (valValue . valueContent' -> ValIdent (IdentValStmt oldRefCount))
+        (valValue . valueContent' -> ValInteger 1))) _ _ ->
       absPathIfArg oldRefCount
-    StoreInst { storeValue = (valueContent' ->
-      InstructionC AddInst { binaryLhs = (valueContent' ->
-        ConstantC ConstantInt { constantIntValue = 1 })
-                           , binaryRhs = (valueContent' ->
-        InstructionC oldRefCount) })} ->
+    Store _ (valueContent' -> ValInstr (Arith Add {}
+        (valValue . valueContent' -> ValInteger 1)
+        (valValue . valueContent' -> ValIdent (IdentValStmt oldRefCount)))) _ _ ->
       absPathIfArg oldRefCount
-    CallInst { callFunction = (valueContent' -> FunctionC f)
-             , callArguments = [(a,_)]
-             } ->
-      absPathThroughCall seSumm scalarEffectAddOne (functionParameters f) a
-    InvokeInst { invokeFunction = (valueContent' -> FunctionC f)
-               , invokeArguments = [(a,_)]
-               } ->
-      absPathThroughCall seSumm scalarEffectAddOne (functionParameters f) a
+    Call _ _ (valValue . valueContent' -> ValSymbol (SymValDefine f)) [a] ->
+      absPathThroughCall seSumm scalarEffectSubOne (defArgs f) a
+    Invoke _ (valValue . valueContent' -> ValSymbol (SymValDefine f)) [a] _ _ ->
+      absPathThroughCall seSumm scalarEffectSubOne (defArgs f) a
     _ -> Nothing
   return (p, Witness i "incr")
 
@@ -559,19 +530,19 @@ absPathThroughCall seSumm effect [singleFormal] actual = do
   -- argument).  The access path describes *which* component of the
   -- argument is modified.
   calleeAccessPath <- effect seSumm singleFormal
-  case valueContent' actual of
-    InstructionC i -> do
+  case valValue (valueContent' actual) of
+    ValIdent (IdentValStmt i) -> do
       actualAccessPath <- accessPath i
       -- Now see if the actual passed to this call is derived from one
       -- of the formal parameters of the current function.  This
       -- access path tells us which component of the argument was
       -- passed to the callee.
-      case valueContent' (accessPathBaseValue actualAccessPath) of
+      case valValue (valueContent' (accessPathBaseValue actualAccessPath)) of
         -- If it really was derived from an argument, connect up
         -- the access paths for the caller and callee so we have a
         -- single description of the field that was modified
         -- (interprocedurally).
-        ArgumentC _ ->
+        ValIdent (IdentValArgument _) ->
           abstractAccessPath actualAccessPath `appendAccessPath` calleeAccessPath
         _ -> Nothing
     _ -> Nothing
@@ -579,13 +550,13 @@ absPathThroughCall _ _ _ _ = Nothing
 
 -- | If the Instruction produces an access path rooted at an Argument,
 -- return the corresponding AbstractAccessPath
-absPathIfArg :: Instruction -> Maybe AbstractAccessPath
+absPathIfArg :: Stmt -> Maybe AbstractAccessPath
 absPathIfArg i =
   case accessPath i of
     Nothing -> Nothing
     Just cap ->
-      case valueContent' (accessPathBaseValue cap) of
-        ArgumentC _ -> Just (abstractAccessPath cap)
+      case valValue (valueContent' (accessPathBaseValue cap)) of
+        ValIdent (IdentValArgument _) -> Just (abstractAccessPath cap)
         _ -> Nothing
 
 -- Testing
@@ -596,7 +567,7 @@ refCountSummaryToTestFormat (RefCountSummary _ unrefArgs refArgs _ _) =
   foldr addIfRefFound mempty (HM.toList unrefArgs)
   where
     addIfRefFound (uarg, UnrefData fieldPath _ _) acc =
-      let ufunc = identifierAsString $ functionName $ argumentFunction uarg
-      in case matchingTypeAndPath (argumentType uarg) fieldPath fst refArgs of
+      let ufunc = (\(Symbol str) -> str) $ defName $ argDefine uarg
+      in case matchingTypeAndPath (argType uarg) fieldPath fst refArgs of
         Nothing -> acc
         Just rfunc -> M.insert ufunc rfunc acc

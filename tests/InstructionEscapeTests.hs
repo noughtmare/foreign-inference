@@ -6,12 +6,14 @@ import Data.Monoid
 import System.Environment ( getArgs, withArgs )
 import System.FilePath
 import Test.HUnit ( assertEqual )
+import Data.ByteString (hGetContents)
 
 import LLVM.Analysis
 import LLVM.Analysis.CallGraph
 import LLVM.Analysis.CallGraphSCCTraversal
 import LLVM.Analysis.Util.Testing
-import LLVM.Parse
+import Data.LLVM.BitCode
+import Text.LLVM.Resolve
 
 import Foreign.Inference.Interface
 import Foreign.Inference.Preprocessing
@@ -37,7 +39,7 @@ main = do
 
   withArgs [] $ testAgainstExpected requiredOptimizations bcParser testDescriptors
   where
-    bcParser = parseLLVMFile defaultParserOptions
+    bcParser _f h = fmap (resolve . (\(Right x) -> x)) . parseBitCode =<< hGetContents h
 
 analyzeInstructionEscapes :: DependencySummary -> Module -> Bool
 analyzeInstructionEscapes ds m =
@@ -51,17 +53,18 @@ analyzeInstructionEscapes ds m =
     res = callGraphSCCTraversal cg analysisFunc mempty
     Just i = find isCallInst (moduleInstructions m)
     notReturn ignoreInst =
-      case ignoreInst of
-        RetInst {} -> True
+      case stmtInstr ignoreInst of
+        Ret {} -> True
+        RetVoid {} -> True
         _ -> False
 
 
-moduleInstructions :: Module -> [Instruction]
-moduleInstructions = concatMap functionInstructions . moduleDefinedFunctions
+moduleInstructions :: Module -> [Stmt]
+moduleInstructions = concatMap defStmts . modDefines
 
 
-isCallInst :: Instruction -> Bool
+isCallInst :: Stmt -> Bool
 isCallInst i =
-  case i of
-    CallInst {} -> True
+  case stmtInstr i of
+    Call {} -> True
     _ -> False

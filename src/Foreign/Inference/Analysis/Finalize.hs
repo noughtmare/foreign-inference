@@ -1,5 +1,6 @@
 {-# LANGUAGE TypeSynonymInstances, FlexibleInstances, MultiParamTypeClasses, RankNTypes #-}
 {-# LANGUAGE ViewPatterns, DeriveGeneric, TemplateHaskell #-}
+{-# LANGUAGE FlexibleContexts #-}
 -- | Identify function arguments that are *finalized*.  An argument is
 -- finalized if, on every path, it is passed as a parameter to a
 -- function that finalizes it *or* the argument is NULL.
@@ -31,6 +32,7 @@ import Data.HashSet ( HashSet )
 import qualified Data.HashSet as HS
 import Data.Map ( Map )
 import qualified Data.Map as M
+import qualified Data.Map.Strict as MS
 import Data.Maybe ( fromMaybe )
 import Data.Monoid
 import Data.Set ( Set )
@@ -61,6 +63,9 @@ $(makeLenses ''FinalizerSummary)
 
 instance Eq FinalizerSummary where
   (FinalizerSummary s1 _) == (FinalizerSummary s2 _) = s1 == s2
+
+instance Semigroup FinalizerSummary where
+  (<>) = mappend
 
 instance Monoid FinalizerSummary where
   mempty = FinalizerSummary mempty mempty
@@ -93,14 +98,14 @@ data FinalizerData =
                 }
 
 -- | Find all functions of one parameter that finalize the given type.
-automaticFinalizersForType :: FinalizerSummary -> Type -> [Function]
+automaticFinalizersForType :: FinalizerSummary -> Type -> [Define]
 automaticFinalizersForType (FinalizerSummary s _) t =
-  filter (isSingleton . functionParameters) funcs
+  filter (isSingleton . defArgs) funcs
   where
     isSingleton = (==1) . length
     args = HM.keys s
-    compatibleArgs = filter ((t==) . argumentType) args
-    funcs = map argumentFunction compatibleArgs
+    compatibleArgs = filter ((t==) . argType) args
+    funcs = map argDefine compatibleArgs
 
 -- | The dataflow fact tracking things that are not finalizedOrNull
 data FinalizerInfo =
@@ -111,7 +116,7 @@ data FinalizerInfo =
 
 $(makeLenses ''FinalizerInfo)
 
-identifyFinalizers :: (FuncLike funcLike, HasFunction funcLike,
+identifyFinalizers :: (FuncLike funcLike, HasDefine funcLike,
                        HasCFG funcLike, HasNullSummary funcLike)
                       => DependencySummary
                       -> IndirectCallSummary
@@ -153,7 +158,7 @@ type Analysis = AnalysisMonad FinalizerData ()
 -- Otherwise, calls to exit in error branches make functions into non-finalizers
 -- when they otherwise might be.
 
-finalizerAnalysis :: (FuncLike funcLike, HasFunction funcLike,
+finalizerAnalysis :: (FuncLike funcLike, HasDefine funcLike,
                       HasCFG funcLike, HasNullSummary funcLike)
                      => funcLike
                      -> FinalizerSummary
@@ -163,7 +168,7 @@ finalizerAnalysis funcLike s@(FinalizerSummary summ _) = do
   -- from the rest of the module so far.  We want to be able to access
   -- this in the Reader environment
   let envMod e = e { moduleSummary = s }
-      univSet = HS.fromList $ filter isPointer (functionParameters f)
+      univSet = HS.fromList $ filter isPointer (defArgs f)
       top = FinalizerInfo univSet mempty
       fact0 = FinalizerInfo mempty mempty
       analysis = fwdDataflowEdgeAnalysis top meet finalizerTransfer finalizerEdgeTransfer
@@ -180,10 +185,10 @@ finalizerAnalysis funcLike s@(FinalizerSummary summ _) = do
   -- up-to-date info.
   return $! (finalizerSummary .~ newInfo `HM.union` summ) s
   where
-    f = getFunction funcLike
+    f = getDefine funcLike
 
 finalizerEdgeTransfer :: FinalizerInfo
-                         -> Instruction
+                         -> Stmt
                          -> Analysis [(BasicBlock, FinalizerInfo)]
 finalizerEdgeTransfer info i = return $ fromMaybe [] $ do
   (nullBlock, val, _) <- branchNullInfo i
@@ -191,38 +196,38 @@ finalizerEdgeTransfer info i = return $ fromMaybe [] $ do
   return $ [(nullBlock, addNullArg val info)]
 
 finalizerTransfer :: FinalizerInfo
-                     -> Instruction
+                     -> Stmt
                      -> Analysis FinalizerInfo
 finalizerTransfer info i =
-  case i of
-    CallInst { callFunction = calledFunc, callArguments = args } ->
-      callTransfer i (stripBitcasts calledFunc) (map fst args) info
-    InvokeInst { invokeFunction = calledFunc, invokeArguments = args } ->
-      callTransfer i (stripBitcasts calledFunc) (map fst args) info
+  case stmtInstr i of
+    Call _ _ calledFunc args ->
+      callTransfer i (stripBitcasts calledFunc) args info
+    Invoke _ calledFunc args _ _ ->
+      callTransfer i (stripBitcasts calledFunc) args info
     _ -> return info
 
 addNullArg :: Value -> FinalizerInfo -> FinalizerInfo
 addNullArg v info = fromMaybe info $ do
-  arg <- fromValue v
+  ValIdent (IdentValArgument arg) <- pure (valValue v)
   return $ (finalizedOrNull %~ HS.insert arg) info
 
-callTransfer :: Instruction -> Value -> [Value] -> FinalizerInfo -> Analysis FinalizerInfo
+callTransfer :: Stmt -> Value -> [Value] -> FinalizerInfo -> Analysis FinalizerInfo
 callTransfer callInst v as info =
   case valueContent' v of
-    InstructionC LoadInst { } -> do
+    ValInstr Load{} -> do
       sis <- analysisEnvironment singleInitSummary
-      let Just f = instructionFunction callInst
+      let f = bbDefine (stmtBasicBlock callInst)
           fv = toValue f
           finits = filter (/=fv) $ indirectCallInitializers sis v
           xfer initializer = callTransfer callInst initializer as info
-      case null finits of
-        True -> return info
-        False -> do
+      minfos <- mapM xfer finits
+      case minfos of
+        [] -> return info
+        info1:infos -> do
           -- If there is more than one static initializer for the
           -- function pointer being called, treat it as a finalizer
           -- IFF all of the initializers agree and finalize the same
           -- argument.
-          info1:infos <- mapM xfer finits
           case all (==info1) infos of
             True -> return info1
             False -> return info
@@ -237,7 +242,7 @@ callTransfer callInst v as info =
     -- their arguments.  After each function in an SCC is analyzed, then combine
     -- all of the results and move on to iteration two.  This would pick up
     -- mutually-recursive finalizers.
-    checkArg ms acc (ix, (valueContent' -> ArgumentC a)) = do
+    checkArg ms acc (ix, valValue . valueContent' -> ValIdent (IdentValArgument a)) = do
       attrs <- lookupArgumentSummaryList ms v ix
       case PAFinalize `elem` attrs of
         False -> return acc
@@ -248,7 +253,7 @@ callTransfer callInst v as info =
 -- Perhaps modify the function call transfer here?  If we are calling a
 -- finalizer on a value that we know IS NOT NULL,
 
-addArgWithWitness :: Argument -> Instruction -> String -> FinalizerInfo -> FinalizerInfo
+addArgWithWitness :: Argument -> Stmt -> String -> FinalizerInfo -> FinalizerInfo
 addArgWithWitness a i reason (FinalizerInfo s m) =
   let w = Witness i reason
   in FinalizerInfo { _finalizedOrNull = HS.insert a s
@@ -259,8 +264,8 @@ addArgWithWitness a i reason (FinalizerInfo s m) =
 
 isPointer :: (IsValue a) => a -> Bool
 isPointer v =
-  case valueType v of
-    TypePointer _ _ -> True
+  case valType (toValue v) of
+    (PtrTo _) -> True
     _ -> False
 
 
@@ -270,7 +275,7 @@ finalizerSummaryToTestFormat :: FinalizerSummary -> Map String (Set String)
 finalizerSummaryToTestFormat (FinalizerSummary m _) = convert m
   where
     convert = foldr (addElt . toFuncNamePair) mempty . HM.keys
-    addElt (f, a) = M.insertWith' S.union f (S.singleton a)
+    addElt (f, a) = MS.insertWith S.union f (S.singleton a)
     toFuncNamePair arg =
-      let f = argumentFunction arg
-      in (show (functionName f), show (argumentName arg))
+      let f = argDefine arg
+      in (prettySymbol (defName f), argName arg)

@@ -80,6 +80,7 @@ import Control.Lens ( Getter, Lens', makeLenses, (.~), to, view )
 import Control.Monad ( foldM )
 import Data.Map ( Map )
 import qualified Data.Map as M
+import qualified Data.Map.Strict as MS
 import Data.Maybe ( fromMaybe )
 import Data.Monoid
 import Data.Set ( Set )
@@ -121,6 +122,9 @@ data NullableSummary =
 
 $(makeLenses ''NullableSummary)
 
+instance Semigroup NullableSummary where
+  (<>) = mappend
+
 instance Monoid NullableSummary where
   mempty = NullableSummary mempty mempty
   mappend (NullableSummary s1 d1) (NullableSummary s2 d2) =
@@ -143,7 +147,7 @@ summarizeNullArgument a (NullableSummary s _) =
     Just ws -> [(PANotNull, ws)]
 
 identifyNullable :: forall funcLike compositeSummary .
-                    (FuncLike funcLike, HasFunction funcLike,
+                    (FuncLike funcLike, HasDefine funcLike,
                      HasCFG funcLike, HasNullSummary funcLike,
                      HasCDG funcLike, HasDomTree funcLike,
                      HasBlockReturns funcLike)
@@ -170,7 +174,7 @@ data NullData = ND { moduleSummary :: NullableSummary
                    }
 
 -- Change to a formula cache?
-data NullState = NState { phiCache :: HashMap Instruction (Maybe Value) }
+data NullState = NState { phiCache :: HashMap Stmt (Maybe Value) }
 
 data NullInfo = NInfo { nonNullArguments :: Set Argument
                       , nullWitnesses :: Map Argument (Set Witness)
@@ -195,7 +199,7 @@ meetNullInfo ni1 ni2 =
 -- This set of arguments is added to the global summary data (set of
 -- all non-nullable arguments).
 nullableAnalysis :: (FuncLike funcLike, HasCFG funcLike,
-                     HasFunction funcLike, HasCDG funcLike,
+                     HasDefine funcLike, HasCDG funcLike,
                      HasNullSummary funcLike, HasDomTree funcLike,
                      HasBlockReturns funcLike)
                     => (ReturnSummary, Maybe ErrorSummary)
@@ -216,7 +220,7 @@ nullableAnalysis (retSumm, errSumm) funcLike s@(NullableSummary summ _) = do
                    , nullPointersSummary = nps
                    , blockRets = getBlockReturns funcLike
                    }
-      args = filter isPointer (functionParameters f)
+      args = filter isPointer (defArgs f)
       top = NInfo (S.fromList args) mempty
       fact0 = NInfo mempty mempty
       analysis = fwdDataflowAnalysis top meetNullInfo (nullTransfer errSumm)
@@ -232,7 +236,7 @@ nullableAnalysis (retSumm, errSumm) funcLike s@(NullableSummary summ _) = do
   let newSumm = foldr (\(a, ws) acc -> HM.insert a ws acc) summ argsAndWitnesses
   return $! (nullableSummary .~ newSumm) s
   where
-    f = getFunction funcLike
+    f = getDefine funcLike
     nps = getNullSummary funcLike
 
 attachWitness :: Map Argument (Set Witness)
@@ -251,13 +255,13 @@ nullEdgeTransfer ni i = return $ fromMaybe [] $ do
   return [(notNullBlock, ni { nonNullArguments = S.insert arg (nonNullArguments ni) })]
 -}
 
-nullTransfer :: Maybe ErrorSummary -> NullInfo -> Instruction -> Analysis NullInfo
+nullTransfer :: Maybe ErrorSummary -> NullInfo -> Stmt -> Analysis NullInfo
 nullTransfer Nothing ni i = nullTransfer' ni i
 nullTransfer (Just errSumm) ni i
-  | instructionIsTerminator i = do
+  | stmtIsTerminator i = do
     brs <- analysisEnvironment blockRets
-    let Just bb = instructionBasicBlock i
-        f = basicBlockFunction bb
+    let bb = stmtBasicBlock i
+        f = bbDefine bb
     case blockReturn brs bb of
       Nothing -> nullTransfer' ni i
       Just rv -> do
@@ -265,7 +269,7 @@ nullTransfer (Just errSumm) ni i
         case any (matchesReturnValue rv) descs of
           False -> nullTransfer' ni i
           True -> do
-            let formals = S.fromList $ functionParameters f
+            let formals = S.fromList $ defArgs f
                 ni' = ni { nonNullArguments = formals
                          , nullWitnesses =
                            S.foldl' (addWitness "arg/ret-error" i) (nullWitnesses ni) formals
@@ -274,7 +278,7 @@ nullTransfer (Just errSumm) ni i
   | otherwise = nullTransfer' ni i
 
 matchesReturnValue :: Value -> ErrorDescriptor -> Bool
-matchesReturnValue (fromValue -> Just ConstantInt { constantIntValue = v}) d =
+matchesReturnValue (valValue -> ValInteger v) d =
   case errorReturns d of
     ReturnConstantPtr _ -> False -- we don't really use these
     ReturnConstantInt is -> S.member (fromIntegral v) is
@@ -286,26 +290,26 @@ matchesReturnValue _ _ = False
 -- to identify pointers that are dereferenced when they *might* be
 -- NULL.  Also map these possibly-NULL pointers to any corresponding
 -- parameters.
-nullTransfer' :: NullInfo -> Instruction -> Analysis NullInfo
+nullTransfer' :: NullInfo -> Stmt -> Analysis NullInfo
 nullTransfer' ni i =
-  case i of
-    LoadInst { loadAddress = ptr } ->
+  case stmtInstr i of
+    Load ptr _ _ ->
       valueDereferenced i ptr ni
-    StoreInst { storeAddress = ptr } ->
+    Store ptr _ _ _ ->
       valueDereferenced i ptr ni
-    AtomicRMWInst { atomicRMWPointer = ptr } ->
+    AtomicRW _ _ ptr _ _ _ ->
       valueDereferenced i ptr ni
-    AtomicCmpXchgInst { atomicCmpXchgPointer = ptr } ->
+    CmpXchg _ _ ptr _ _ _ _ _ ->
       valueDereferenced i ptr ni
 
-    CallInst { callFunction = calledFunc, callArguments = args } ->
-      callTransfer i (stripBitcasts calledFunc) (map fst args) ni
-    InvokeInst { invokeFunction = calledFunc, invokeArguments = args } ->
-      callTransfer i (stripBitcasts calledFunc) (map fst args) ni
+    Call _ _ calledFunc args ->
+      callTransfer i (stripBitcasts calledFunc) args ni
+    Invoke _ calledFunc args _ _ ->
+      callTransfer i (stripBitcasts calledFunc) args ni
 
     _ -> return ni
 
-valueDereferenced :: Instruction -> Value -> NullInfo -> Analysis NullInfo
+valueDereferenced :: Stmt -> Value -> NullInfo -> Analysis NullInfo
 valueDereferenced i ptr ni
   | Just v <- memAccessBase ptr = do
     v' <- mustExecuteValue v
@@ -314,7 +318,7 @@ valueDereferenced i ptr ni
       arg <- fromValue v''
       let w = Witness i "deref"
       return ni { nonNullArguments = S.insert arg (nonNullArguments ni)
-                , nullWitnesses = M.insertWith' S.union arg (S.singleton w) ws
+                , nullWitnesses = MS.insertWith S.union arg (S.singleton w) ws
                 }
   | otherwise = return ni
   where
@@ -330,29 +334,29 @@ valueDereferenced i ptr ni
 -- This function strips off intermediate bitcasts.
 memAccessBase :: Value -> Maybe Value
 memAccessBase ptr =
-  case valueContent' ptr of
-    GlobalVariableC _ -> Nothing
-    InstructionC AllocaInst {} -> Nothing
+  case valValue (valueContent' ptr) of
+    ValSymbol (SymValGlobal _) -> Nothing
+    ValIdent (IdentValStmt (stmtInstr -> Alloca {})) -> Nothing
     -- For optimized code, arguments (which we care about) can be
     -- loaded/stored to directly (without an intervening alloca).
-    ArgumentC a -> Just (toValue a)
+    ValIdent (IdentValArgument a) -> Just (toValue a)
     -- In this case, we have two levels of dereference.  The first
     -- level (la) is a global or alloca (or result of another
     -- load/GEP).  This represents a source-level dereference of a
     -- local pointer.
-    InstructionC LoadInst { loadAddress = la } ->
+    ValIdent (IdentValStmt (stmtInstr -> Load la _ _)) ->
       Just (stripBitcasts la)
     -- GEP instructions can appear in sequence for nested field
     -- accesses.  We want the base of the access chain, so walk back
     -- as far as possible and return the lowest-level GEP base.
-    InstructionC GetElementPtrInst { getElementPtrValue = base } ->
+    ValIdent (IdentValStmt (stmtInstr -> GEP _ base _)) ->
       memAccessBase base
     _ -> Just (stripBitcasts ptr)
 
 -- | A split out transfer function for function calls.  Looks up
 -- summary values for called functions/params and records relevant
 -- information in the current dataflow fact.
-callTransfer ::  Instruction
+callTransfer ::  Stmt
                  -> Value
                  -> [Value]
                  -> NullInfo
@@ -364,9 +368,9 @@ callTransfer i calledFunc args ni = do
 --  nullSumm <- analysisEnvironment nullPointersSummary
   retAttrs <- lookupFunctionSummaryList retSumm calledFunc
 
-  let Just bb = instructionBasicBlock i
-      f = basicBlockFunction bb
-      formals = S.fromList $ functionParameters f
+  let bb = stmtBasicBlock i
+      f = bbDefine bb
+      formals = S.fromList $ defArgs f
   -- let nullValues = nullPointersAt nullSumm i
   --     nullArgs :: Set Argument
   --     nullArgs = S.fromList $ mapMaybe fromValue nullValues
@@ -393,18 +397,18 @@ callTransfer i calledFunc args ni = do
         True -> valueDereferenced i arg acc
 
 addWitness :: String
-              -> Instruction
+              -> Stmt
               -> Map Argument (Set Witness)
               -> Argument
               -> Map Argument (Set Witness)
 addWitness reason i m a =
-  M.insertWith' S.union a (S.singleton (Witness i reason)) m
+  MS.insertWith S.union a (S.singleton (Witness i reason)) m
 
 isIndirectCallee :: Value -> Bool
 isIndirectCallee val =
-  case valueContent' val of
-    FunctionC _ -> False
-    ExternalFunctionC _ -> False
+  case valValue (valueContent' val) of
+    ValSymbol (SymValDefine _) -> False
+    ValSymbol (SymValDeclare _) -> False
     _ -> True
 
 -- We can tell that a piece of code MUST execute if:
@@ -429,9 +433,9 @@ isIndirectCallee val =
 
 mustExecuteValue :: Value -> Analysis (Maybe Value)
 mustExecuteValue v =
-  case valueContent' v of
-    InstructionC SelectInst {} -> return Nothing
-    InstructionC i@PhiNode { phiIncomingValues = ivs } -> do
+  case valValue (valueContent' v) of
+    ValIdent (IdentValStmt (stmtInstr -> Select {})) -> return Nothing
+    ValIdent (IdentValStmt i@(stmtInstr -> Phi _ ivs)) -> do
       s <- analysisGet
       case HM.lookup i (phiCache s) of
         Just mv -> return mv
@@ -441,7 +445,7 @@ mustExecuteValue v =
           return mv
     _ -> return (Just v)
 
-mustExec' :: Instruction -> [(Value, Value)] -> Analysis (Maybe Value)
+mustExec' :: Stmt -> [(Value, BasicBlock)] -> Analysis (Maybe Value)
 mustExec' i ivs = do
   cdg <- analysisEnvironment controlDepGraph
   dt <- analysisEnvironment domTree
@@ -449,25 +453,21 @@ mustExec' i ivs = do
   case cdeps of
     [] -> return Nothing
     [_] -> do
-      let predTerms = map (id *** (basicBlockTerminatorInstruction . toBB)) ivs
+      let predTerms = map (second (last . bbStmts)) ivs
           nonBackedges = filter (isNotBackedge dt i) predTerms
-      case filter (isUnconditional . snd) nonBackedges of
+      case filter (isUnconditional . stmtInstr . snd) nonBackedges of
         [] -> return Nothing
         [(v,_)] -> return (Just v)
         _ -> return Nothing
     _ -> return Nothing
   where
-    toBB v =
-      case valueContent v of
-        BasicBlockC bb -> bb
-        _ -> error ("Foreign.Inference.Analysis.Nullable.mustExec': Expected basic block: " ++ show v)
-    isUnconditional UnconditionalBranchInst {} = True
+    isUnconditional Jump {} = True
     isUnconditional _ = False
     isNotBackedge g inst (_, br) = not (dominates g inst br)
 
 isPointer :: (IsValue v) => v -> Bool
-isPointer v = case valueType v of
-  TypePointer _ _ -> True
+isPointer v = case valType (toValue v) of
+  (PtrTo _) -> True
   _ -> False
 
 
@@ -480,7 +480,7 @@ nullSummaryToTestFormat (NullableSummary m _) =
   foldr addArg M.empty (HM.toList m)
   where
     addArg (a, _) acc =
-      let f = argumentFunction a
-          k = show (functionName f)
-          v = S.singleton (show (argumentName a))
-      in M.insertWith' S.union k v acc
+      let f = argDefine a
+          k = prettySymbol (defName f)
+          v = S.singleton (argName a)
+      in MS.insertWith S.union k v acc

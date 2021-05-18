@@ -29,7 +29,7 @@ import qualified Data.Set as S
 import Text.Printf
 
 class HasDiagnostics a where
-  diagnosticLens :: Simple Lens a Diagnostics
+  diagnosticLens :: Lens' a Diagnostics
   diagnosticLens = lens (const mempty) const
 
 -- | A source location.
@@ -79,7 +79,7 @@ showDiagnostic Diagnostic { diagnosticLocation = Just loc
 -- | A set of diagnostics.  Diagnostics can be merged via the 'Monoid'
 -- interface.
 newtype Diagnostics = DS (Set Diagnostic)
-                    deriving (Monoid)
+                    deriving (Semigroup, Monoid)
 
 instance NFData Diagnostics where
   rnf d@(DS s) = s `deepseq` d `seq` ()

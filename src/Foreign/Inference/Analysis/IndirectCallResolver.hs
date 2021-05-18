@@ -59,6 +59,11 @@ data IndirectCallSummary =
       , globalInits :: HashMap (Type, Int) (HashSet Value)
       }
 
+constExpr' :: ConstExpr -> ConstExpr
+constExpr' (ConstConv BitCast (valValue -> ValConstExpr x) _) = constExpr' x
+constExpr' (ConstConv BitCast _ _) = error "Unexpected constant bitcast of non-ConstantExpr"
+constExpr' x = x
+
 -- If i is a Load of a global with an initializer (or a GEP of a
 -- global with a complex initializer), just use the initializer to
 -- determine the points-to set.  Obviously this isn't general.
@@ -67,66 +72,62 @@ data IndirectCallSummary =
 -- analysis for other values.
 indirectCallInitializers :: IndirectCallSummary -> Value -> [Value]
 indirectCallInitializers ics v =
-  case valueContent' v of
-    FunctionC f -> [toValue f]
-    ExternalFunctionC ef -> [toValue ef]
-    InstructionC li@LoadInst { loadAddress = (valueContent' ->
-      InstructionC GetElementPtrInst { getElementPtrValue = base
-                                     , getElementPtrIndices = [ (valueContent -> ConstantC ConstantInt { constantIntValue = 0 })
-                                                              , (valueContent -> ConstantC ConstantInt { constantIntValue = (fromIntegral -> ix) })
-                                                              ]
-                                     })} -> fromMaybe (lookupInst li) $ do
-      let baseTy = valueType base
+  case valValue (valueContent' v) of
+    ValSymbol (SymValDefine f) -> [toValue f]
+    ValSymbol (SymValDeclare ef) -> [toValue ef]
+    ValIdent (IdentValStmt li@(stmtInstr -> Load (valueContent' ->
+      ValInstr (GEP _ base
+        [ valValue -> ValInteger 0, valValue -> ValInteger (fromIntegral -> ix)]
+        )) _ _)) -> fromMaybe (lookupStmt li) $ do
+      let baseTy = valType base
       globInits <- HM.lookup (baseTy, ix) (globalInits ics)
-      return $ HS.toList globInits ++ lookupInst li
+      return $ HS.toList globInits ++ lookupStmt li
     -- Here, walk the initializer if it isn't a simple integer
     -- constant We discard the first index because while the global
     -- variable is a pointer type, the initializer is not (because all
     -- globals get an extra indirection as r-values)
-    InstructionC li@LoadInst { loadAddress = (valueContent' ->
-      ConstantC ConstantValue { constantInstruction = (valueContent' ->
-        InstructionC GetElementPtrInst { getElementPtrValue = (valueContent' ->
-          GlobalVariableC GlobalVariable { globalVariableInitializer = Just i })
-                                       , getElementPtrIndices = (valueContent -> ConstantC ConstantInt { constantIntValue = 0 }) :ixs
-                                       })})} ->
-      maybe (lookupInst li) (:[]) $ resolveInitializer i ixs
-    InstructionC li@LoadInst { loadAddress = (valueContent' ->
-      GlobalVariableC GlobalVariable { globalVariableInitializer = Just i })} ->
-      case valueContent' i of
+    ValIdent (IdentValStmt li@(stmtInstr -> Load (valValue . valueContent' ->
+      ValConstExpr (constExpr' ->
+        ConstGEP _ _ _ ((valValue . valueContent' -> ValSymbol (SymValGlobal Global { globalValue = Just i }))
+          : (valValue -> ValInteger 0)
+          : ixs))) _ _)) ->
+      maybe (lookupStmt li) (:[]) $ resolveInitializer i ixs
+    ValIdent (IdentValStmt li@(stmtInstr -> Load (valValue . valueContent' ->
+      ValSymbol (SymValGlobal Global { globalValue = Just i })) _ _)) ->
+      case valValue (valueContent' i) of
         -- All globals have some kind of initializer; if it is a zero
         -- or constant (non-function) initializer, just ignore it and
         -- use the more complex fallback.
-        ConstantC _ -> lookupInst li
-        _ -> [i]
-    InstructionC li@LoadInst { } ->
-      lookupInst li
-    InstructionC i -> lookupInst i
+        -- FIXME
+        ValSymbol _ -> [i]
+        ValIdent _ -> [i]
+        _ -> lookupStmt li
+    ValIdent (IdentValStmt li@(stmtInstr -> Load {})) ->
+      lookupStmt li
+    ValIdent (IdentValStmt i) -> lookupStmt i
     _ -> []
   where
-    lookupInst i = pointsTo (summaryTargets ics) (toValue i)
+    lookupStmt i = pointsTo (summaryTargets ics) (toValue i)
 
 resolveInitializer :: Value -> [Value] -> Maybe Value
 resolveInitializer v [] = return (stripBitcasts v)
 resolveInitializer v (ix:ixs) = do
   intVal <- fromConstantInt ix
-  case valueContent v of
-    ConstantC ConstantArray { constantArrayValues = vs } ->
+  case valValue v of
+    ValArray _ vs ->
       if length vs <= intVal then Nothing else resolveInitializer (vs !! intVal) ixs
-    ConstantC ConstantStruct { constantStructValues = vs } ->
+    ValStruct vs _ ->
       if length vs <= intVal then Nothing else resolveInitializer (vs !! intVal) ixs
     _ -> Nothing
 
 fromConstantInt :: Value -> Maybe Int
-fromConstantInt v =
-  case valueContent v of
-    ConstantC ConstantInt { constantIntValue = iv } ->
-      return $ fromIntegral iv
-    _ -> Nothing
+fromConstantInt (valValue -> ValInteger iv) = Just $ fromIntegral iv
+fromConstantInt _ = Nothing
 
 -- | Resolve the targets of an indirect call instruction.  This works
 -- with both C++ virtual function dispatch and some other common
 -- function pointer call patterns.  It is unsound and incomplete.
-indirectCallTargets :: IndirectCallSummary -> Instruction -> [Value]
+indirectCallTargets :: IndirectCallSummary -> Instr -> [Value]
 indirectCallTargets ics i =
   -- If this is a virtual function call (C++), use the virtual
   -- function resolver.  Otherwise, fall back to the normal function
@@ -136,31 +137,29 @@ indirectCallTargets ics i =
     vfuncTargets = resolveVirtualCallee (resolverCHA ics) i
     fptrTargets =
       case i of
-        CallInst { callFunction = f } ->
-          indirectCallInitializers ics f
-        InvokeInst { invokeFunction = f } ->
-          indirectCallInitializers ics f
+        Call _ _  f _    -> indirectCallInitializers ics f
+        Invoke _ f _ _ _ -> indirectCallInitializers ics f
         _ -> []
 
 -- | Run the initializer analysis: a cheap pass to identify a subset
 -- of possible function pointers that object fields can point to.
 identifyIndirectCallTargets :: Module -> IndirectCallSummary
 identifyIndirectCallTargets m =
-  ICS (runPointsToAnalysisWith ignoreNonFptr m) (runCHA m) gis
+  ICS (runPointsToAnalysisWith ignoreNonFptr m) (runCHA m) (gis)
   where
-    ignoreNonFptr = ignoreNonFptrType . valueType
+    ignoreNonFptr = ignoreNonFptrType . valType
     ignoreNonFptrType t =
       case t of
-        TypeFunction _ _ _ -> False
-        TypePointer t' _ -> ignoreNonFptrType t'
+        FunTy _ _ _ -> False
+        PtrTo t' -> ignoreNonFptrType t'
         _ -> True
-    gis = foldr extractGlobalFieldInits mempty (moduleGlobalVariables m)
+    gis = foldr extractGlobalFieldInits mempty (modGlobals m)
 
 -- FIXME: One day push this hack down into the andersen analysis.
-extractGlobalFieldInits :: GlobalVariable -> HashMap (Type, Int) (HashSet Value) -> HashMap (Type, Int) (HashSet Value)
+extractGlobalFieldInits :: Global -> HashMap (Type, Int) (HashSet Value) -> HashMap (Type, Int) (HashSet Value)
 extractGlobalFieldInits gv acc = fromMaybe acc $ do
-  ConstantC ConstantStruct { constantStructValues = vs } <- globalVariableInitializer gv
-  return $ foldr (addFieldInit (valueType gv)) acc (zip [0..] vs)
+  (valValue -> ValStruct vs _) <- globalValue gv
+  return $ foldr (addFieldInit (globalType gv)) acc (zip [0..] vs)
   where
     addFieldInit t (ix, v) =
       HM.insertWith HS.union (t, ix) (HS.singleton v)

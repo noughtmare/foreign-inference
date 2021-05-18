@@ -6,13 +6,15 @@ import Data.Set ( Set )
 import System.Environment ( getArgs, withArgs )
 import System.FilePath
 import Test.HUnit ( assertEqual )
+import Data.ByteString ( hGetContents )
 
 import LLVM.Analysis
 import LLVM.Analysis.AccessPath
 import LLVM.Analysis.CallGraph
 import LLVM.Analysis.CallGraphSCCTraversal
 import LLVM.Analysis.Util.Testing
-import LLVM.Parse
+import Data.LLVM.BitCode
+import Text.LLVM.Resolve
 
 import Foreign.Inference.Interface
 import Foreign.Inference.Preprocessing
@@ -39,7 +41,7 @@ main = do
         ]
   withArgs [] $ testAgainstExpected requiredOptimizations bcParser testDescriptors
   where
-    bcParser = parseLLVMFile defaultParserOptions
+    bcParser _f h = fmap (resolve . (\(Right x) -> x)) . parseBitCode =<< hGetContents h
 
 type Summary = (Int, String, [AccessType])
 

@@ -21,6 +21,8 @@ import Data.Monoid
 import qualified Data.Text as T
 import Data.Word ( Word8 )
 import System.FilePath
+import Data.Map (toList)
+import Data.Maybe (mapMaybe, fromMaybe)
 
 import Codec.Archive
 import LLVM.Analysis
@@ -88,9 +90,13 @@ contentAndSubBody = do
                        , rest
                        ]
 
-isSubprogramMetadata :: Metadata -> Bool
-isSubprogramMetadata MetaDWSubprogram {} = True
-isSubprogramMetadata _ = False
+getSubprogramMd :: ValMd -> Maybe DISubprogram
+getSubprogramMd (ValMdDebugInfo (DebugInfoSubprogram x)) = Just x
+getSubprogramMd _ = Nothing
+
+getFileMd :: ValMd -> Maybe DIFile
+getFileMd (ValMdDebugInfo (DebugInfoFile x)) = Just x
+getFileMd _ = Nothing
 
 -- | Make a best effort to find the implementation of the given
 -- Function in its associated source archive.  The lookup is based on
@@ -98,24 +104,24 @@ isSubprogramMetadata _ = False
 --
 -- From there, the starting line number of the function will be used
 -- to try to isolate the body of the function in the file.
-getFunctionText :: ArchiveIndex -> Function -> Maybe (FilePath, Int, ByteString)
+getFunctionText :: ArchiveIndex -> Define -> Maybe (FilePath, Int, ByteString)
 getFunctionText a func = do
-  let mds = filter isSubprogramMetadata $ functionMetadata func
+  let mds = mapMaybe (getSubprogramMd . snd) $ toList $ defMetadata func
   case mds of
     [md] -> do
-      let line = metaSubprogramLine md
-      ctxt <- metaSubprogramContext md
+      let line = dispLine md
+      ctxt <- fromMaybe (error "Unexpectedly not a file") . getFileMd <$> dispFile md
 
-      let f = metaFileSourceFile ctxt
-          d = metaFileSourceDir ctxt
-          absSrcFile = T.unpack d </> T.unpack f
+      let f = difFilename ctxt
+          d = difDirectory ctxt
+          absSrcFile = d </> f
 
       bs <- entryContentSuffix a absSrcFile
       let functionText = P.parse (isolator (fromIntegral line)) bs
 
           mkTuple txt = Just (absSrcFile, fromIntegral line, txt)
 
-      maybe Nothing mkTuple (P.maybeResult functionText)
+      mkTuple =<< P.maybeResult functionText
     _ -> Nothing
 
 {-# ANN module "HLint: ignore Use if" #-}

@@ -25,9 +25,9 @@ go visited q
 addValuesFrom :: HashSet Value -> Value -> HashSet Value
 addValuesFrom q v =
   case valueContent' v of
-    InstructionC PhiNode { phiIncomingValues = pvs } ->
+    ValInstr (Phi _ pvs) ->
       let vs = map fst pvs
       in foldr S.insert q vs
-    InstructionC SelectInst { selectTrueValue = tv, selectFalseValue = fv } ->
+    ValInstr (Select _ tv fv) ->
       foldr S.insert q [tv, fv]
     _ -> S.insert v $ S.insert (stripBitcasts v) q

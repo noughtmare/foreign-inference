@@ -6,12 +6,14 @@ import Data.Set ( Set )
 import System.Environment ( getArgs, withArgs )
 import System.FilePath ( (<.>) )
 import Test.HUnit ( assertEqual )
+import Data.ByteString (hGetContents)
 
 import LLVM.Analysis
 import LLVM.Analysis.CallGraph
 import LLVM.Analysis.CallGraphSCCTraversal
 import LLVM.Analysis.Util.Testing
-import LLVM.Parse
+import Data.LLVM.BitCode
+import Text.LLVM.Resolve
 
 import Foreign.Inference.Interface
 import Foreign.Inference.Preprocessing
@@ -38,7 +40,7 @@ main = do
                         ]
   withArgs [] $ testAgainstExpected requiredOptimizations bcParser testDescriptors
   where
-    bcParser = parseLLVMFile defaultParserOptions
+    bcParser _f h = fmap (resolve . (\(Right x) -> x)) . parseBitCode =<< hGetContents h
 
 analyzeTransfer :: DependencySummary -> Module -> Map String (Set String)
 analyzeTransfer ds m =
@@ -47,7 +49,7 @@ analyzeTransfer ds m =
     pta = identifyIndirectCallTargets m
     cg = callGraph m pta []
     funcLikes :: [FunctionMetadata]
-    funcLikes = map fromFunction (moduleDefinedFunctions m)
+    funcLikes = map fromDefine (modDefines m)
     analyses :: [ComposableAnalysis AnalysisSummary FunctionMetadata]
     analyses = [ identifyFinalizers ds pta finalizerSummary
                , identifySAPPTRels ds sapPTRelSummary

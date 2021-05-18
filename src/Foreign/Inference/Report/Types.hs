@@ -13,7 +13,7 @@ import Foreign.Inference.Interface
 -- | An encapsulation of the report
 data InterfaceReport =
   InterfaceReport { reportModule :: Module
-                  , reportFunctionBodies :: Map Function (FilePath, Int, ByteString)
+                  , reportFunctionBodies :: Map Define (FilePath, Int, ByteString)
                   , reportArchive :: ArchiveIndex
                   , reportSummaries :: [ModuleSummary]
                   , reportDependencies :: DependencySummary

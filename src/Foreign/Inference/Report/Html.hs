@@ -10,9 +10,10 @@ import Control.Arrow ( (&&&) )
 import Control.Monad ( forM_, when )
 import Data.ByteString.Lazy.Char8 ( ByteString, unpack )
 import Data.List ( intercalate, partition, sort )
-import Data.Maybe ( mapMaybe )
+import Data.Maybe ( mapMaybe, fromMaybe )
 import Data.Map ( Map )
 import qualified Data.Map as M
+import qualified Data.Map.Strict as MS
 import Data.Monoid
 import Data.Text ( Text )
 import qualified Data.Text as T
@@ -22,11 +23,14 @@ import Text.Blaze.Html5 ( toValue, toHtml, (!), Html, AttributeValue )
 import qualified Text.Blaze.Html5 as H
 import qualified Text.Blaze.Html5.Attributes as A
 
-import LLVM.Analysis hiding ( toValue )
+import LLVM.Analysis hiding ( toValue, Linkage )
+import qualified LLVM.Analysis as LLVM
 
 import Foreign.Inference.Interface
 import Foreign.Inference.Interface.Metadata
 import Foreign.Inference.Report.Types
+
+import Debug.Trace
 
 -- | Options for generating the HTML summary page
 data SummaryOption = LinkDrilldowns -- ^ Include links to the drilldown pages for each function
@@ -41,7 +45,7 @@ data SummaryOption = LinkDrilldowns -- ^ Include links to the drilldown pages fo
 --
 -- FIXME: It would also be awesome to include call graph information
 -- (as in doxygen)
-htmlFunctionPage :: InterfaceReport -> Function -> FilePath -> Int -> ByteString -> Html
+htmlFunctionPage :: InterfaceReport -> Define -> FilePath -> Int -> ByteString -> Html
 htmlFunctionPage r f srcFile startLine functionText =
   [shamlet|
 $doctype 5
@@ -69,15 +73,15 @@ $doctype 5
       #{H.preEscapedToMarkup (initialScript calledFunctions startLine)}
 |]
   where
-    funcName = identifierContent (functionName f)
-    allInstructions = concatMap basicBlockInstructions (functionBody f)
+    funcName = (\(Symbol str) -> str) (defName f)
+    allInstructions = concatMap bbStmts (defBody f)
     calledFunctions = foldr (extractCalledFunctionNames aliasReverseIndex) [] allInstructions
     sig = commaSepList args drilldownSignatureArgument
     m = reportModule r
-    aliasReverseIndex = foldr indexAliases mempty (moduleAliases m)
-    args = functionParameters f
-    fretType = case functionType f of
-      TypeFunction rt _ _ -> rt
+    aliasReverseIndex = foldr indexAliases mempty (modAliases m)
+    args = defArgs f
+    fretType = case getType f of
+      FunTy rt _ _ -> rt
       rtype -> rtype
     allAnnots = manualAnnotations $ reportDependencies r
     uannots = userFunctionAnnotations allAnnots f
@@ -90,11 +94,11 @@ $doctype 5
 moduleAnnotEntry :: ModuleAnnotation -> Html
 moduleAnnotEntry = toHtml . show
 
-indexAliases :: GlobalAlias -> Map Function [GlobalAlias] -> Map Function [GlobalAlias]
+indexAliases :: GlobalAlias -> Map Define [GlobalAlias] -> Map Define [GlobalAlias]
 indexAliases a m =
-  case globalAliasTarget a of
-    FunctionC f -> M.insertWith' (++) f [a] m
-    GlobalAliasC a' -> indexAliases a' m
+  case valValue (aliasTarget a) of
+    ValSymbol (SymValDefine f) -> MS.insertWith (++) f [a] m
+    ValSymbol (SymValAlias a') -> indexAliases a' m
     _ -> m
 
 -- | Replace tabs with two spaces.  This makes the line number
@@ -105,23 +109,23 @@ preprocessFunction = foldr replaceTab "" . unpack
     replaceTab '\t' acc = ' ' : ' ' : acc
     replaceTab c acc = c : acc
 
-extractCalledFunctionNames :: Map Function [GlobalAlias] -> Instruction -> [(Text, Text)] -> [(Text, Text)]
+extractCalledFunctionNames :: Map Define [GlobalAlias] -> Stmt -> [(String, String)] -> [(String, String)]
 extractCalledFunctionNames aliasReverseIndex i acc =
   case valueContent' i of
-    InstructionC CallInst { callFunction = cv } -> maybeExtract cv acc
-    InstructionC InvokeInst { invokeFunction = cv } -> maybeExtract cv acc
+    ValInstr (Call _ _ cv _) -> maybeExtract cv acc
+    ValInstr (Invoke _ cv _ _ _) -> maybeExtract cv acc
     _ -> acc
   where
     maybeExtract cv names =
-      case valueContent' cv of
-        FunctionC f ->
+      case valValue (valueContent' cv) of
+        (ValSymbol (SymValDefine f)) ->
           case M.lookup f aliasReverseIndex of
             Nothing ->
-              let ic = identifierContent (functionName f)
+              let ic = (\(Symbol str) -> str) (defName f)
               in (ic, ic) : names
             Just aliases ->
-              let ic = identifierContent (functionName f)
-                  aliasNames = map (identifierContent . globalAliasName) aliases
+              let ic = (\(Symbol str) -> str) (defName f)
+                  aliasNames = map ((\(Symbol str) -> str) . aliasName) aliases
               in zip aliasNames (repeat ic) ++ names
         _ -> names
 
@@ -129,7 +133,7 @@ extractCalledFunctionNames aliasReverseIndex i acc =
 -- snippet in each drilldown.  It invokes the syntax highlighter and
 -- also links all of the functions called to their definitions (if
 -- available).
-initialScript :: [(Text, Text)] -> Int -> Text
+initialScript :: [(String, String)] -> Int -> Text
 initialScript calledFuncNames startLine =
   [st|
 $(window).bind("load", function() {
@@ -141,19 +145,19 @@ $(window).bind("load", function() {
   where
     toJsTuple (txtName, target) = mconcat ["['", txtName, "', '", target, "']"]
     quotedNames = map toJsTuple calledFuncNames
-    funcNameList = T.intercalate ", " quotedNames
+    funcNameList = intercalate ", " quotedNames
 
 
 drilldownArgumentEntry :: Int -> InterfaceReport -> Argument -> Html
 drilldownArgumentEntry startLine r arg =
   [shamlet|
-<span class="code-type">#{show (argumentType arg)}
-  <a href="#" onclick="editor.highlightText('highlight', '#{argName}');">
-    #{argName}
+<span class="code-type">#{show (argType arg)}
+  <a href="#" onclick="editor.highlightText('highlight', '#{argumentName}');">
+    #{argumentName}
   #{drilldownArgumentAnnotations startLine annots}
 |]
   where
-    argName = identifierContent (argumentName arg)
+    argumentName = argName arg
     annots = concatMap (summarizeArgument arg) (reportSummaries r)
 
 drilldownArgumentAnnotations :: Int -> [(ParamAnnotation, [Witness])] -> Html
@@ -185,23 +189,26 @@ drilldownFunctionAnnotations startLine annots =
         let clickScript = [st|highlightLines(#{show startLine}, [#{intercalate "," (mapMaybe showWL witnessLines)}]);|]
         in [shamlet| <a href="#" onclick="#{H.preEscapedToMarkup clickScript}">#{show a} |]
 
-instructionSrcLoc :: Instruction -> Maybe Metadata
+instructionSrcLoc :: Stmt -> Maybe ValMd
 instructionSrcLoc i =
-  case filter isSrcLoc (instructionMetadata i) of
+  case filter isSrcLoc (map snd (stmtMd i)) of
     [md] -> Just md
     _ -> Nothing
   where
     isSrcLoc m =
       case m of
-        MetaSourceLocation {} -> True
+        ValMdLoc {} -> True
         _ -> False
 
-instructionToLine :: Instruction -> Maybe Int
+instructionToLine :: Stmt -> Maybe Int
 instructionToLine i =
   case instructionSrcLoc i of
     Nothing -> Nothing
-    Just (MetaSourceLocation _ r _ _) -> Just (fromIntegral r)
-    _ -> error ("Foreign.Inference.Report.Html.instructionToLine: Expected source location: " ++ show (instructionMetadata i))
+    Just (ValMdLoc (DebugLoc l _ _ _ _)) -> Just (fromIntegral l)
+    _ -> error ("Foreign.Inference.Report.Html.instructionToLine: Expected source location" {- ++ show (stmtMd i) -})
+
+moduleIdentifier :: Module -> String
+moduleIdentifier = fromMaybe "Unknown" . modSourceName
 
 -- | Generate an index page listing all of the functions in a module.
 -- Each listing shows the parameters and their inferred annotations.
@@ -225,16 +232,16 @@ htmlIndexPage r opts = H.docTypeHtml $ do
     H.h1 "Annotated Types"
     indexPageTypeListing r ts
   where
-    pageTitle :: Text
-    pageTitle = (moduleIdentifier m) `mappend` " summary report"
+    pageTitle :: String
+    pageTitle = (moduleIdentifier m) <> " summary report"
     m = reportModule r
     mannots = concatMap (summarizeModule m) (reportSummaries r)
     ts = moduleInterfaceStructTypes m
-    (externs, ps) = partition isExtern (moduleDefinedFunctions m)
+    (externs, ps) = partition isExtern (modDefines m)
     privates = map tagName ps
     externsWithAliases = map tagName externs ++ exposedAliases
 
-    tagName f = (f, identifierAsString (functionName f))
+    tagName f = (f, (\(Symbol str) -> str) (defName f))
 
     isExtern :: (HasVisibility a) => a -> Bool
     isExtern f = isVisible f && isExternLinkage f
@@ -242,41 +249,41 @@ htmlIndexPage r opts = H.docTypeHtml $ do
     isVisible :: (HasVisibility a) => a -> Bool
     isVisible v =
       case valueVisibility v of
-        VisibilityHidden -> False
+        HiddenVisibility -> False
         _ -> True
 
     isExternLinkage :: (HasVisibility a) => a -> Bool
     isExternLinkage v =
       case valueLinkage v of
-        LTExternal -> True
-        LTAvailableExternally -> True
-        LTDLLExport -> True
-        LTExternalWeak -> True
+        LLVM.External -> True
+        LLVM.AvailableExternally -> True
+        LLVM.DLLExport -> True
+        LLVM.ExternWeak -> True
         _ -> False
 
-    exposedAliases :: [(Function, String)]
-    exposedAliases = mapMaybe externAliasToFunc (moduleAliases m)
+    exposedAliases :: [(Define, String)]
+    exposedAliases = mapMaybe externAliasToFunc (modAliases m)
 
     externAliasToFunc a
       | not (isExtern a) = Nothing
       | otherwise =
-        case globalAliasTarget a of
-          FunctionC f ->
-            let internalName = identifierAsString (functionName f)
-            in Just $ (f { functionName = globalAliasName a }, internalName)
+        case valValue (aliasTarget a) of
+          (ValSymbol (SymValDefine f)) ->
+            let internalName = (\(Symbol str) -> str) (defName f)
+            in Just (f { defName = aliasName a }, internalName)
           _ -> Nothing
 
 class HasVisibility a where
-  valueVisibility :: a -> VisibilityStyle
-  valueLinkage :: a -> LinkageType
+  valueVisibility :: a -> Visibility
+  valueLinkage :: a -> LLVM.Linkage
 
-instance HasVisibility Function where
-  valueVisibility = functionVisibility
-  valueLinkage = functionLinkage
+instance HasVisibility Define where
+  valueVisibility = fromMaybe DefaultVisibility . defVisibility
+  valueLinkage = fromMaybe External . defLinkage
 
 instance HasVisibility GlobalAlias where
-  valueVisibility = globalAliasVisibility
-  valueLinkage = globalAliasLinkage
+  valueVisibility = fromMaybe DefaultVisibility . aliasVisibility
+  valueLinkage = fromMaybe External . aliasLinkage
 
 indexPageTypeListing :: InterfaceReport -> [CType] -> Html
 indexPageTypeListing r ts = do
@@ -295,13 +302,13 @@ indexPageAnnotatedType (t, annots) = do
     H.span ! A.class_ "code-comment" $ toHtml ("/* " ++ (show annots) ++ " */")
 
 
-indexPageFunctionListing :: InterfaceReport -> Bool -> AttributeValue -> [(Function, String)] -> Html
+indexPageFunctionListing :: InterfaceReport -> Bool -> AttributeValue -> [(Define, String)] -> Html
 indexPageFunctionListing r linkFuncs divId funcs = do
   H.div ! A.id divId $ do
     H.ul $ do
       forM_ funcs (indexPageFunctionEntry r linkFuncs)
 
-indexPageFunctionEntry :: InterfaceReport -> Bool -> (Function, String) -> Html
+indexPageFunctionEntry :: InterfaceReport -> Bool -> (Define, String) -> Html
 indexPageFunctionEntry r linkFunc (f, internalName) = do
   H.li $ do
     H.span ! A.class_ "code" $ do
@@ -325,13 +332,13 @@ indexPageFunctionEntry r linkFunc (f, internalName) = do
     fannots = concat [ userFunctionAnnotations allAnnots f
                      , concatMap (map fst . summarizeFunction f) (reportSummaries r)
                      ]
-    fname = identifierContent (functionName f)
+    fname = (\(Symbol str) -> str) (defName f)
     -- Use a bit of trickery to flag when we need to insert commas
     -- after arguments (so we don't end up with a trailing comma in
     -- the argument list)
-    args = functionParameters f
-    fretType = case functionType f of
-      TypeFunction rt _ _ -> rt
+    args = defArgs f
+    fretType = case getType f of
+      FunTy rt _ _ -> rt
       rtype -> rtype
 
 drilldownSignatureArgument :: Argument -> Html
@@ -340,18 +347,18 @@ drilldownSignatureArgument arg =
 <span class="code-type">#{paramType}</span> #{paramName}
 |]
   where
-    paramType = show (argumentType arg)
-    paramName = identifierContent (argumentName arg)
+    paramType = show (argType arg)
+    paramName = argName arg
 
 indexPageArgument :: InterfaceReport -> (Int, Argument) -> Html
 indexPageArgument r (ix, arg) = do
   H.span ! A.class_ "code-type" $ toHtml paramType
   stringToHtml " " >> toHtml paramName >> stringToHtml " " >> indexArgumentAnnotations annots
   where
-    paramType = show (argumentType arg)
-    paramName = identifierContent (argumentName arg)
+    paramType = show (argType arg)
+    paramName = argName arg
     allAnnots = manualAnnotations $ reportDependencies r
-    annots = concat [ userParameterAnnotations allAnnots (argumentFunction arg) ix
+    annots = concat [ userParameterAnnotations allAnnots (argDefine arg) ix
                     , concatMap (map fst . summarizeArgument arg) (reportSummaries r)
                     ]
 

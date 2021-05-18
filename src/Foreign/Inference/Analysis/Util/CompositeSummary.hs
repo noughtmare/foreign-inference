@@ -63,7 +63,7 @@ import Foreign.Inference.Interface
 -- | The value we derive from each function during the call graph
 -- traversal.  For now, it just adds a CFG.
 data FunctionMetadata =
-  FunctionMetadata { functionOriginal :: Function
+  FunctionMetadata { functionOriginal :: Define
                    , functionCFG :: CFG
                    , functionCDG :: CDG
                    , functionDomTree :: DominatorTree
@@ -78,8 +78,8 @@ instance HasNullSummary FunctionMetadata where
 instance HasBlockReturns FunctionMetadata where
   getBlockReturns = functionBlockReturns
 
-instance HasFunction FunctionMetadata where
-  getFunction = functionOriginal
+instance HasDefine FunctionMetadata where
+  getDefine = functionOriginal
 
 instance HasCFG FunctionMetadata where
   getCFG = functionCFG
@@ -91,7 +91,7 @@ instance HasPostdomTree FunctionMetadata where
   getPostdomTree = functionPostdomTree
 
 instance FuncLike FunctionMetadata where
-  fromFunction f =
+  fromDefine f =
     FunctionMetadata { functionOriginal = f
                      , functionCFG = cfg
                      , functionCDG = cdg
@@ -129,6 +129,9 @@ $(makeLenses ''AnalysisSummary)
 
 instance NFData AnalysisSummary where
   rnf = genericRnf
+
+instance Semigroup AnalysisSummary where
+  (<>) = mappend
 
 instance Monoid AnalysisSummary where
   mempty = AnalysisSummary { _nullableSummary = mempty

@@ -28,11 +28,14 @@ import Foreign.Inference.Diagnostics
 import Foreign.Inference.Interface
 import Foreign.Inference.AnalysisMonad
 
-type SummaryType = HashSet Function
+type SummaryType = HashSet Define
 data ReturnSummary = ReturnSummary !SummaryType
                    deriving (Eq, Generic)
 
 instance HasDiagnostics ReturnSummary
+
+instance Semigroup ReturnSummary where
+  (<>) = mappend
 
 instance Monoid ReturnSummary where
   mempty = ReturnSummary mempty
@@ -62,7 +65,7 @@ identifyReturns ds lns =
     analysisWrapper f rs@(ReturnSummary s) = do
       res <- noReturnAnalysis (extSumm rs) f s
       return $! ReturnSummary res
-    extSumm :: ReturnSummary -> ExternalFunction -> Analysis Bool
+    extSumm :: ReturnSummary -> Declare -> Analysis Bool
     extSumm rs ef = do
       summ <- lookupFunctionSummary rs ef
       case summ of

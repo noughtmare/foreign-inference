@@ -60,23 +60,23 @@ library
                  Foreign.Inference.Interface.Types,
                  Foreign.Inference.Internal.FlattenValue
   build-depends: base >= 4 && < 5,
-                 unordered-containers >= 0.2.1.0 && < 0.3,
+                 unordered-containers,
                  mtl >= 2 && < 3,
                  -- aeson >= 0.4.0.0 && < 0.6.1.0,
-                 aeson >= 0.7 && < 0.9,
+                 aeson >= 0.7 && < 1.6,
                  scientific,
                  loch-th >= 0.2,
-                 llvm-analysis >= 0.3.0,
+                 llvm-analysis,
                  lens >= 1,
                  failure >= 0.2,
                  GenericPretty > 1,
-                 transformers >= 0.2 && < 0.5,
+                 transformers >= 0.2 && < 0.6,
                  file-embed >= 0.0.4.2,
-                 sbv == 3.1,
+                 sbv == 8.14,
                  vector,
                  binary,
                  hashable >= 1.1 && < 2,
-                 containers,
+                 containers >= 0.6.3.1,
                  filepath,
                  text >= 0.11 && < 2,
                  bytestring,
@@ -97,8 +97,8 @@ library
                  safe-failure,
                  archive-inspection,
                  directory,
-                 blaze-builder >= 0.3 && < 0.4,
-                 blaze-html >= 0.6 && < 0.8,
+                 blaze-builder >= 0.3 && < 0.5,
+                 blaze-html >= 0.6 && < 0.10,
                  shakespeare >= 2 && < 3,
                  parallel-io >= 0.3 && < 0.4
   ghc-options: -Wall -funbox-strict-fields
@@ -115,10 +115,10 @@ test-suite ArrayTests
   type: exitcode-stdio-1.0
   main-is: ArrayTests.hs
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 filepath, HUnit, containers
+                 filepath, HUnit, containers, bytestring
 
 test-suite NullableTests
   default-language: Haskell2010
@@ -126,10 +126,10 @@ test-suite NullableTests
   type: exitcode-stdio-1.0
   main-is: NullableTests.hs
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
-                 base == 4.*,
-                 filepath, HUnit, containers
+                 base == 4.*, lens,
+                 filepath, HUnit, containers, bytestring
 
 test-suite RefCountTests
   default-language: Haskell2010
@@ -137,10 +137,10 @@ test-suite RefCountTests
   type: exitcode-stdio-1.0
   main-is: RefTests.hs
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 filepath, HUnit, containers
+                 filepath, HUnit, containers, bytestring
 
 test-suite FinalizerTests
   default-language: Haskell2010
@@ -148,10 +148,10 @@ test-suite FinalizerTests
   type: exitcode-stdio-1.0
   main-is: FinalizerTests.hs
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 filepath, HUnit, containers
+                 filepath, HUnit, containers, bytestring
   ghc-options: -Wall
 
 test-suite AllocatorTests
@@ -160,10 +160,10 @@ test-suite AllocatorTests
   type: exitcode-stdio-1.0
   main-is: AllocatorTests.hs
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 filepath, HUnit, containers
+                 filepath, HUnit, containers, bytestring
   ghc-options: -Wall -rtsopts -threaded
 
 test-suite OutputTests
@@ -172,10 +172,10 @@ test-suite OutputTests
   type: exitcode-stdio-1.0
   main-is: OutputTests.hs
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 filepath, HUnit, containers
+                 filepath, HUnit, containers, bytestring
   ghc-options: -Wall -rtsopts
 
 
@@ -185,7 +185,7 @@ test-suite OutputTests
 --   main-is: EscapeTests.hs
 --   hs-source-dirs: tests
 --   build-depends: llvm-analysis >= 0.3.0,
---                  llvm-data-interop >= 0.3.0,
+--                  llvm-pretty-bc-parser, llvm-pretty-referential,
 --                  foreign-inference >= 0.3.0,
 --                  base == 4.*,
 --                  mtl >= 2,
@@ -198,11 +198,11 @@ test-suite InstructionEscapeTests
   main-is: InstructionEscapeTests.hs
   hs-source-dirs: tests
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  mtl > 2,
                  base == 4.*,
-                 bytestring, filepath, containers, HUnit
+                 bytestring, filepath, containers, HUnit, bytestring
   ghc-options: -Wall -rtsopts
 
 test-suite IndirectCallTests
@@ -211,10 +211,10 @@ test-suite IndirectCallTests
   main-is: IndirectCallTests.hs
   hs-source-dirs: tests
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 containers, HUnit, filepath
+                 containers, HUnit, filepath, bytestring
   ghc-options: -Wall
 
 -- test-suite ErrorHandlingTests
@@ -224,10 +224,10 @@ test-suite IndirectCallTests
 --   hs-source-dirs: tests
 --   ghc-options: -Wall
 --   build-depends: llvm-analysis >= 0.3.0,
---                  llvm-data-interop >= 0.3.0,
+--                  llvm-pretty-bc-parser, llvm-pretty-referential,
 --                  foreign-inference >= 0.3.0,
 --                  base == 4.*,
---                  containers, HUnit, filepath
+--                  containers, HUnit, filepath, bytestring
 
 test-suite TransferTests
   default-language: Haskell2010
@@ -236,10 +236,10 @@ test-suite TransferTests
   hs-source-dirs: tests
   ghc-options: -Wall
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 containers, HUnit, filepath
+                 containers, HUnit, filepath, bytestring
 
 test-suite SAPTests
   default-language: Haskell2010
@@ -248,10 +248,10 @@ test-suite SAPTests
   hs-source-dirs: tests
   ghc-options: -Wall
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 containers, HUnit, filepath
+                 containers, HUnit, filepath, bytestring
 
 test-suite SAPArgumentTests
   default-language: Haskell2010
@@ -260,10 +260,10 @@ test-suite SAPArgumentTests
   hs-source-dirs: tests
   ghc-options: -Wall
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 containers, HUnit, filepath
+                 containers, HUnit, filepath, bytestring
 
 test-suite SAPFinalizeTests
   default-language: Haskell2010
@@ -272,7 +272,7 @@ test-suite SAPFinalizeTests
   hs-source-dirs: tests
   ghc-options: -Wall
   build-depends: llvm-analysis >= 0.3.0,
-                 llvm-data-interop >= 0.3.0,
+                 llvm-pretty-bc-parser, llvm-pretty-referential,
                  foreign-inference >= 0.3.0,
                  base == 4.*,
-                 containers, HUnit, filepath
+                 containers, HUnit, filepath, bytestring

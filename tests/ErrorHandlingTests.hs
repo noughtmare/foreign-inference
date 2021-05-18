@@ -49,13 +49,13 @@ analyzeErrors ds m = toTestFormat eres fs
     funcLikes = map fromFunction (moduleDefinedFunctions m)
     eres = identifyErrorHandling funcLikes ds pta
 
-toTestFormat :: ErrorSummary -> [Function] -> TestFormat
+toTestFormat :: ErrorSummary -> [Define] -> TestFormat
 toTestFormat eres = foldr checkSummary mempty
   where
     checkSummary f acc = fromMaybe acc $ do
       let s = summarizeFunction f eres
       (FAReportsErrors acts rcs, _) <- F.find isErrRetAnnot s
-      let fname = identifierAsString (functionName f)
+      let fname = (\(Symbol str) -> str) (defName f)
       return $ M.insert fname (errorFuncs acts, rcs) acc
 
 isErrRetAnnot :: (FuncAnnotation, a) -> Bool

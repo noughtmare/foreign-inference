@@ -39,6 +39,9 @@ data ScalarEffectSummary = ScalarEffectSummary !ScalarEffectResult
 
 instance HasDiagnostics ScalarEffectSummary
 
+instance Semigroup ScalarEffectSummary where
+  (<>) = mappend
+
 instance Monoid ScalarEffectSummary where
   mempty = ScalarEffectSummary mempty
   mappend (ScalarEffectSummary s1) (ScalarEffectSummary s2) =
@@ -60,7 +63,7 @@ summarizeEffectArgument a (ScalarEffectSummary s) =
     Just (EffectSub1 (AbstractAccessPath t _ ats)) ->
       [(PAScalarEffectSubOne (show t) (map snd ats), [])]
 
-identifyScalarEffects :: (FuncLike funcLike, HasCFG funcLike, HasFunction funcLike)
+identifyScalarEffects :: (FuncLike funcLike, HasCFG funcLike, HasDefine funcLike)
                          => Lens' compositeSummary ScalarEffectSummary
                          -> ComposableAnalysis compositeSummary funcLike
 identifyScalarEffects =

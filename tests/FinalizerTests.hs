@@ -6,12 +6,14 @@ import Data.Set ( Set )
 import System.FilePath ( (<.>) )
 import System.Environment ( getArgs, withArgs )
 import Test.HUnit ( assertEqual )
+import Data.ByteString (hGetContents)
 
 import LLVM.Analysis
 import LLVM.Analysis.CallGraph
 import LLVM.Analysis.CallGraphSCCTraversal
 import LLVM.Analysis.Util.Testing
-import LLVM.Parse
+import Data.LLVM.BitCode
+import Text.LLVM.Resolve
 
 import Foreign.Inference.Interface
 import Foreign.Inference.Preprocessing
@@ -19,9 +21,12 @@ import Foreign.Inference.Analysis.Finalize
 import Foreign.Inference.Analysis.IndirectCallResolver
 import Foreign.Inference.Analysis.Util.CompositeSummary
 
+import System.IO (hSetBuffering, BufferMode (NoBuffering), stdout)
+
 main :: IO ()
 main = do
   args <- getArgs
+  hSetBuffering stdout NoBuffering
   let pattern = case args of
         [] -> "tests/finalize/*.c"
         [infile] -> infile
@@ -35,7 +40,7 @@ main = do
                         ]
   withArgs [] $ testAgainstExpected requiredOptimizations parser testDescriptors
   where
-    parser = parseLLVMFile defaultParserOptions
+    parser _f h = fmap (resolve . (\(Right x) -> x)) . parseBitCode =<< hGetContents h
 
 analyzeFinalize :: DependencySummary -> Module -> Map String (Set String)
 analyzeFinalize ds m =

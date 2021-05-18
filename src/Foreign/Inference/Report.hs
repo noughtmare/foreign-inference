@@ -119,10 +119,10 @@ writeHTMLSummary r dir = do
 
 writeFunctionBodyPage :: InterfaceReport
                          -> FilePath
-                         -> (Function, (FilePath, Int, ByteString))
+                         -> (Define, (FilePath, Int, ByteString))
                          -> IO ()
 writeFunctionBodyPage r dir (f, (srcFile, startLine, body)) = do
-  let funcName = identifierAsString (functionName f)
+  let funcName = (\(Symbol str) -> str) (defName f)
       filename = dir </> "functions" </> funcName <.> "html"
       functionPage = htmlFunctionPage r f srcFile startLine body
 
@@ -134,7 +134,7 @@ writeFunctionBodyPage r dir (f, (srcFile, startLine, body)) = do
 compileDetailedReport :: Module -> ArchiveIndex -> [ModuleSummary] -> DependencySummary -> InterfaceReport
 compileDetailedReport m a = InterfaceReport m bodies a
   where
-    fs = moduleDefinedFunctions m
+    fs = modDefines m
     bodies = foldr bodyExtractor M.empty fs
     bodyExtractor f acc =
       case getFunctionText a f of

@@ -1,5 +1,5 @@
 {-# LANGUAGE DeriveGeneric, TemplateHaskell, ViewPatterns #-}
-{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE RankNTypes, FlexibleContexts #-}
 -- | An analysis to identify interfaces that transfer ownership of objects.
 --
 -- The motivation for this analysis is that escape analysis is a poor
@@ -81,6 +81,9 @@ $(makeLenses ''TransferSummary)
 instance Eq TransferSummary where
   (TransferSummary as1 _) == (TransferSummary as2 _) = as1 == as2
 
+instance Semigroup TransferSummary where
+  (<>) = mappend
+
 instance Monoid TransferSummary where
   mempty = TransferSummary mempty mempty
   mappend (TransferSummary t1 d1) (TransferSummary t2 d2) =
@@ -129,7 +132,7 @@ instance SummarizeModule TransferSummary where
 -- This could additionally depend on the ref count analysis and just
 -- strip off transfer tags from ref counted types.
 
-identifyTransfers :: (HasFunction funcLike, Eq compositeSummary)
+identifyTransfers :: (HasDefine funcLike, Eq compositeSummary)
                      => [funcLike]
                      -> CallGraph
                      -> DependencySummary
@@ -161,7 +164,7 @@ identifyTransfers funcLikes cg ds pta p1res flens slens tlens =
 
 type Analysis = AnalysisMonad () ()
 
-identifyTransferredArguments :: (HasFunction funcLike)
+identifyTransferredArguments :: (HasDefine funcLike)
                                 => IndirectCallSummary
                                 -> SAPSummary
                                 -> Set AbstractAccessPath
@@ -174,10 +177,10 @@ identifyTransferredArguments pta sapSumm ownedFields trSumm flike = do
   -- interprocedural field writes.  This includes container-like
   -- manipulations.
   trSumm' <- foldM checkWrittenFormals trSumm formals
-  foldM checkTransfer trSumm' (functionInstructions f)
+  foldM checkTransfer trSumm' (defStmts f)
   where
-    f = getFunction flike
-    formals = functionParameters f
+    f = getDefine flike
+    formals = defArgs f
     checkWrittenFormals s formal =
       return $ fromMaybe s $ do
         wps <- writePaths formal sapSumm
@@ -188,12 +191,12 @@ identifyTransferredArguments pta sapSumm ownedFields trSumm flike = do
         return $ (transferArguments %~ S.insert formal) s
 
     checkTransfer s i =
-      case i of
+      case stmtInstr i of
         -- This case handles simple transfers (where a function
         -- locally stores an argument into a field of another
         -- argument.  More complex cases are handled in
         -- checkWrittenFormals
-        StoreInst { storeValue = (valueContent' -> ArgumentC sv) }
+        Store (valValue . valueContent' -> ValIdent (IdentValArgument sv)) _ _ _
           | sv `elem` formals -> return $ fromMaybe s $ do
             -- We don't extract the storeAddress above because the
             -- access path construction handles that
@@ -207,16 +210,16 @@ identifyTransferredArguments pta sapSumm ownedFields trSumm flike = do
               False -> return s
           | otherwise -> return s
 
-        CallInst { callFunction = callee, callArguments = (map fst -> args) } ->
+        Call _ _ callee args ->
           calleeArgumentFold (argumentTransfer args) s pta callee args
-        InvokeInst { invokeFunction = callee, invokeArguments = (map fst -> args) } ->
+        Invoke _ callee args _ _ ->
           calleeArgumentFold (argumentTransfer args) s pta callee args
         _ -> return s
 
     -- We only care about call arguments that are actually Arguments
     -- in the caller because field->field transfers are outside the
     -- scope of the analysis.
-    argumentTransfer actuals callee s (ix, (valueContent' -> ArgumentC arg)) = do
+    argumentTransfer actuals callee s (ix, valValue . valueContent' -> ValIdent (IdentValArgument arg)) = do
       annots <- lookupArgumentSummaryList s callee ix
       case PATransfer `elem` annots of
         False ->
@@ -252,10 +255,10 @@ identifyTransferredArguments pta sapSumm ownedFields trSumm flike = do
             _ <- F.find (equivAccessPaths extendedPath) ownedFields
             return $ (transferArguments %~ S.insert writtenFormal) s
 
-localDestNotFinalized :: AccessPath -> Function -> Bool
+localDestNotFinalized :: AccessPath -> Define -> Bool
 localDestNotFinalized acp f = fromMaybe False $ do
   -- An alloca means we stored into a local.
-  AllocaInst {} <- fromValue (accessPathBaseValue acp)
+  Alloca {} <- fromValue (accessPathBaseValue acp)
   -- FIXME: Check to ensure it really isn't finalized.  For now we are
   -- assuming that locals are never finalized, which is almost certainly
   -- true by definition...
@@ -267,7 +270,7 @@ localDestNotFinalized acp f = fromMaybe False $ do
 --
 -- This lets us ignore almost all "local" deletes where some
 -- locally-allocated value is stored in a struct and then finalized.
-isFinalizerContext :: (HasFunction funcLike)
+isFinalizerContext :: (HasDefine funcLike)
                       => CallGraph
                       -> FinalizerSummary
                       -> funcLike
@@ -275,7 +278,7 @@ isFinalizerContext :: (HasFunction funcLike)
 isFinalizerContext cg finSumm flike =
   liftM or $ mapM isFinalizer callers
   where
-    f = getFunction flike
+    f = getDefine flike
     callers = allFunctionCallers cg f
     isFinalizer callee =
       liftM2 fromMaybe (return False) $ runMaybeT (checkFinCtx callee)
@@ -287,9 +290,9 @@ isFinalizerContext cg finSumm flike =
 
 formalArgumentCount :: Value -> MaybeT Analysis Int
 formalArgumentCount v =
-  case valueContent' v of
-    FunctionC fn -> return $ length $ functionParameters fn
-    ExternalFunctionC ef -> return $ length $ externalFunctionParameterTypes ef
+  case valValue (valueContent' v) of
+    (ValSymbol (SymValDefine fn)) -> return $ length $ defArgs fn
+    (ValSymbol (SymValDeclare ef)) -> return $ length $ decArgs ef
     _ -> fail "Not a function"
 
 -- | Add any field passed to a known finalizer to the accumulated Set.
@@ -297,7 +300,7 @@ formalArgumentCount v =
 -- This will eventually need to incorporate shape analysis results.
 -- It will also need to distinguish somehow between fields that are
 -- finalized and elements of container fields that are finalized.
-identifyOwnedFields :: (HasFunction funcLike)
+identifyOwnedFields :: (HasDefine funcLike)
                        => CallGraph
                        -> IndirectCallSummary
                        -> FinalizerSummary
@@ -311,12 +314,12 @@ identifyOwnedFields cg pta finSumm sapSumm ownedFields funcLike = do
     True -> foldM checkFinalize ownedFields insts
     False -> return ownedFields
   where
-    insts = functionInstructions (getFunction funcLike)
+    insts = defStmts (getDefine funcLike)
     checkFinalize acc i =
-      case i of
-        CallInst { callFunction = cf, callArguments = (map fst -> args) } ->
+      case stmtInstr i of
+        Call _ _ cf args ->
           calleeArgumentFold addFieldIfFinalized acc pta cf args
-        InvokeInst { invokeFunction = cf, invokeArguments = (map fst -> args) } ->
+        Invoke _ cf args _ _ ->
           calleeArgumentFold addFieldIfFinalized acc pta cf args
         _ -> return acc
 
@@ -329,8 +332,8 @@ identifyOwnedFields cg pta finSumm sapSumm ownedFields funcLike = do
         False -> return $ fromMaybe acc $ do
           calleeArg <- calleeFormalAt target ix
           ffs <- finalizedPaths calleeArg sapSumm
-          case valueContent' arg of
-            ArgumentC _ ->
+          case valValue (valueContent' arg) of
+            ValIdent (IdentValArgument _) ->
               -- All of the paths described by ffs are owned fields,
               -- so union them with acc.  We don't need the ArgumentC
               -- binding here; it is only to let us know that this
@@ -338,7 +341,7 @@ identifyOwnedFields cg pta finSumm sapSumm ownedFields funcLike = do
               -- we need to propagate information about it upwards in
               -- the summary.
               return $ acc `S.union` S.fromList ffs
-            InstructionC i -> do
+            ValIdent (IdentValStmt i) -> do
               -- We don't need the base argument, we just need to know
               -- that the base is an Argument.
               (cap, _) <- anyArgumentAccessPath i
@@ -355,9 +358,7 @@ identifyOwnedFields cg pta finSumm sapSumm ownedFields funcLike = do
             -- Here, we need to look up the function summary of cf and
             -- see if it is returning some access path of one of its
             -- actual arguments.
-            InstructionC CallInst { callFunction = (valueContent' -> FunctionC cf)
-                                  , callArguments = (map fst -> args)
-                                  } ->
+            ValInstr (Call _ _ (valValue . valueContent' -> ValSymbol (SymValDefine cf)) args) ->
               return $ fromMaybe acc $ do
                 calleeArg <- calleeFormalAt cf ix
                 rps <- returnedPaths cf calleeArg sapSumm
@@ -374,7 +375,7 @@ identifyOwnedFields cg pta finSumm sapSumm ownedFields funcLike = do
                         rps' = mapMaybe (appendAccessPath absPath) rps
                     in return $ acc `S.union` S.fromList rps'
             -- Calling a finalizer on a local access path
-            InstructionC i -> return $ fromMaybe acc $ do
+            (valValue -> ValIdent (IdentValStmt i)) -> return $ fromMaybe acc $ do
               accPath <- accessPath i
               let absPath = abstractAccessPath accPath
               return $ S.insert absPath acc
@@ -383,7 +384,7 @@ identifyOwnedFields cg pta finSumm sapSumm ownedFields funcLike = do
 calleeFormalAt :: (IsValue v) => v -> Int -> Maybe Argument
 calleeFormalAt target ix = do
   callee <- fromValue (toValue target)
-  let params = functionParameters callee
+  let params = defArgs callee
   params `at` ix
 
 accessPathBaseArgument :: AccessPath -> Maybe Argument
@@ -410,7 +411,7 @@ transferSummaryToTestFormat (TransferSummary s _) =
   F.foldr convert mempty s
   where
     convert a m =
-      let f = argumentFunction a
-          k = show (functionName f)
-          v = show (argumentName a)
+      let f = argDefine a
+          k = prettySymbol (defName f)
+          v = argName a
       in M.insertWith S.union k (S.singleton v) m
