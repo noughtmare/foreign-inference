@@ -1,0 +1,1 @@
+fromList [("%struct.S",fromList ["ptr"]),("@f",fromList ["%s"]),("@g",fromList ["%arr","%s"])]

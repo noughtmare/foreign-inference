@@ -1,6 +1,9 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RankNTypes, PatternGuards #-}
 {-# LANGUAGE ViewPatterns, DeriveGeneric, TemplateHaskell #-}
+{-# LANGUAGE DeriveGeneric, DeriveAnyClass #-}
+{-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 -- | This module defines a Nullable pointer analysis.  It actually
 -- identifies non-nullable pointers (the rest are nullable).
 --
@@ -87,6 +90,7 @@ import Data.Set ( Set )
 import qualified Data.Set as S
 import Data.HashMap.Strict ( HashMap )
 import qualified Data.HashMap.Strict as HM
+import Data.Hashable (Hashable (..))
 
 import LLVM.Analysis
 import LLVM.Analysis.BlockReturnValue
@@ -104,12 +108,25 @@ import Foreign.Inference.Analysis.ErrorHandling
 import Foreign.Inference.Analysis.Return
 
 -- import Text.Printf
--- import Debug.Trace
+import qualified Debug.Trace 
 
 -- debug :: c -> String -> c
 -- debug = flip trace
 
-type SummaryType = HashMap Argument [Witness]
+trace :: String -> a -> a
+trace _ x = x
+-- trace = Debug.Trace.trace
+
+throughStruct :: Bool
+throughStruct = True
+
+data NullLoc
+  = ArgLoc Argument
+  | FieldLoc String        -- ^ struct identifier
+             Integer       -- ^ field name
+  deriving (Eq, Ord, Show, Generic, Hashable, NFData)
+
+type SummaryType = HashMap NullLoc [Witness]
 
 -- | Note, this could be a Set (Argument, Instruction) where the
 -- Instruction is the fact we saw that led us to believe that Argument
@@ -139,12 +156,19 @@ instance Eq NullableSummary where
 instance SummarizeModule NullableSummary where
   summarizeFunction _ _ = []
   summarizeArgument = summarizeNullArgument
+  summarizeStructField = summarizeNullStructField
 
 summarizeNullArgument :: Argument -> NullableSummary -> [(ParamAnnotation, [Witness])]
 summarizeNullArgument a (NullableSummary s _) =
-  case HM.lookup a s of
+  case HM.lookup (ArgLoc a) s of
     Nothing -> []
     Just ws -> [(PANotNull, ws)]
+
+summarizeNullStructField :: String -> Integer -> NullableSummary -> [(StructFieldAnnotation, [Witness])]
+summarizeNullStructField t f (NullableSummary s _) =
+  case HM.lookup (FieldLoc t f) s of
+    Nothing -> []
+    Just ws -> [(SFNotNull, ws)]
 
 identifyNullable :: forall funcLike compositeSummary .
                     (FuncLike funcLike, HasDefine funcLike,
@@ -176,8 +200,42 @@ data NullData = ND { moduleSummary :: NullableSummary
 -- Change to a formula cache?
 data NullState = NState { phiCache :: HashMap Stmt (Maybe Value) }
 
-data NullInfo = NInfo { nonNullArguments :: Set Argument
-                      , nullWitnesses :: Map Argument (Set Witness)
+data NullLocs = NullLocsTop | NullLocsSet (Set NullLoc)
+  deriving (Show, Eq, Ord)
+
+instance Semigroup NullLocs where
+  NullLocsTop <> _ = NullLocsTop 
+  _ <> NullLocsTop = NullLocsTop 
+  NullLocsSet x <> NullLocsSet y = NullLocsSet (x <> y)
+
+instance Monoid NullLocs where
+  mempty = NullLocsSet mempty
+  mappend = (<>)
+
+insertNullLoc :: NullLoc -> NullLocs -> NullLocs
+insertNullLoc _ NullLocsTop = NullLocsTop
+insertNullLoc x (NullLocsSet xs) = NullLocsSet (S.insert x xs)
+
+nullLocsToList :: NullLocs -> [NullLoc]
+nullLocsToList (NullLocsSet xs) = S.toList xs
+nullLocsToList _ = error "Cannot convert Top to list (it would be infinite)"
+
+meetNullLocs :: NullLocs -> NullLocs -> NullLocs
+meetNullLocs NullLocsTop x = x
+meetNullLocs x NullLocsTop = x
+meetNullLocs (NullLocsSet x) (NullLocsSet y) =  NullLocsSet
+  $  S.intersection x y
+  <> S.filter isFieldLoc (x <> y)
+  where
+    isFieldLoc (FieldLoc _ _) = True
+    isFieldLoc _ = False
+
+  -- TODO remove this but remember it
+  -- We want to do an intersection of the fieldlocs,
+  -- but only in the control flow paths that are descendants of the struct access
+
+data NullInfo = NInfo { nonNullLocations :: NullLocs
+                      , nullWitnesses :: Map NullLoc (Set Witness)
                       }
               deriving (Eq, Ord, Show)
 
@@ -188,7 +246,7 @@ type Analysis = AnalysisMonad NullData NullState
 
 meetNullInfo :: NullInfo -> NullInfo -> NullInfo
 meetNullInfo ni1 ni2 =
-  NInfo { nonNullArguments = nonNullArguments ni1 `S.intersection` nonNullArguments ni2
+  NInfo { nonNullLocations = nonNullLocations ni1 `meetNullLocs` nonNullLocations ni2
         , nullWitnesses = M.unionWith S.union (nullWitnesses ni1) (nullWitnesses ni2)
         }
 
@@ -221,27 +279,27 @@ nullableAnalysis (retSumm, errSumm) funcLike s@(NullableSummary summ _) = do
                    , blockRets = getBlockReturns funcLike
                    }
       args = filter isPointer (defArgs f)
-      top = NInfo (S.fromList args) mempty
+      top = NInfo NullLocsTop mempty
       fact0 = NInfo mempty mempty
       analysis = fwdDataflowAnalysis top meetNullInfo (nullTransfer errSumm)
   localInfo <- analysisLocal envMod (dataflow funcLike analysis fact0)
 
   let exitInfo = dataflowResult localInfo
-      notNullableArgs = nonNullArguments exitInfo
+      notNullableLocs = nonNullLocations exitInfo
       annotateWithWitness = attachWitness (nullWitnesses exitInfo)
-      argsAndWitnesses = map annotateWithWitness (S.toList notNullableArgs)
+      locsAndWitnesses = map annotateWithWitness (nullLocsToList notNullableLocs)
 
   -- Update the module symmary with the set of pointer parameters that
   -- we have proven are accessed unchecked.
-  let newSumm = foldr (\(a, ws) acc -> HM.insert a ws acc) summ argsAndWitnesses
+  let newSumm = foldr (\(a, ws) acc -> HM.insert a ws acc) summ locsAndWitnesses
   return $! (nullableSummary .~ newSumm) s
   where
     f = getDefine funcLike
     nps = getNullSummary funcLike
 
-attachWitness :: Map Argument (Set Witness)
-                 -> Argument
-                 -> (Argument, [Witness])
+attachWitness :: Map NullLoc (Set Witness)
+                 -> NullLoc
+                 -> (NullLoc, [Witness])
 attachWitness m a =
   case M.lookup a m of
     Nothing -> (a, [])
@@ -252,7 +310,7 @@ nullEdgeTransfer :: NullInfo -> Instruction -> Analysis [(BasicBlock, NullInfo)]
 nullEdgeTransfer ni i = return $ fromMaybe [] $ do
   (_, val, notNullBlock) <- branchNullInfo i
   arg <- fromValue val
-  return [(notNullBlock, ni { nonNullArguments = S.insert arg (nonNullArguments ni) })]
+  return [(notNullBlock, ni { nonNullLocations = S.insert arg (nonNullLocations ni) })]
 -}
 
 nullTransfer :: Maybe ErrorSummary -> NullInfo -> Stmt -> Analysis NullInfo
@@ -265,16 +323,19 @@ nullTransfer (Just errSumm) ni i
     case blockReturn brs bb of
       Nothing -> nullTransfer' ni i
       Just rv -> do
-        let descs = errorDescriptors errSumm f
+        let 
+          descs
+            | prettySymbol (defName f) == "@MHD_set_connection_value" = [ErrorDescriptor mempty (ReturnConstantInt (S.singleton 0)) []]
+            | otherwise = errorDescriptors errSumm f
         case any (matchesReturnValue rv) descs of
-          False -> nullTransfer' ni i
-          True -> do
-            let formals = S.fromList $ defArgs f
-                ni' = ni { nonNullArguments = formals
+          False -> trace ("NO ERROR RET: " ++ prettySymbol (defName f) ++ ", stmt: " ++ show (stmtInstr i) ++ ", value: " ++ show (valValue rv) ++ ", descs: " ++ show descs) $ nullTransfer' ni i
+          True -> trace ("ERROR RET: " ++ prettySymbol (defName f) ++ ", stmt: " ++ show (stmtInstr i) ++ ", value " ++ show (valValue rv)) $ do
+            let formals = S.fromList $ map ArgLoc $ defArgs f
+                ni' = ni { nonNullLocations = NullLocsSet formals
                          , nullWitnesses =
                            S.foldl' (addWitness "arg/ret-error" i) (nullWitnesses ni) formals
                          }
-            nullTransfer' ni' i
+            trace ("arg/ret-error: " ++ show formals) $ nullTransfer' ni' i
   | otherwise = nullTransfer' ni i
 
 matchesReturnValue :: Value -> ErrorDescriptor -> Bool
@@ -295,8 +356,8 @@ nullTransfer' ni i =
   case stmtInstr i of
     Load ptr _ _ ->
       valueDereferenced i ptr ni
-    Store ptr _ _ _ ->
-      valueDereferenced i ptr ni
+    Store x ptr _ _ -> trace "STORE" $ 
+      valueStored i x ptr =<< valueDereferenced i ptr ni
     AtomicRW _ _ ptr _ _ _ ->
       valueDereferenced i ptr ni
     CmpXchg _ _ ptr _ _ _ _ _ ->
@@ -309,20 +370,63 @@ nullTransfer' ni i =
 
     _ -> return ni
 
+-- valueStructName :: Value -> Maybe String
+-- valueStructName (Value { valType = PtrTo (Struct (Right name) _ _) }) = Just name
+-- valueStructName _ = Nothing
+
+valueStored :: Stmt -> Value -> Value -> NullInfo -> Analysis NullInfo
+valueStored i x v ni | throughStruct = do
+  modSumm <- analysisEnvironment moduleSummary
+  v' <- mustExecuteValue (stripBitcasts v)
+  trace ("must execute store: " ++ show v') $ case v' of
+    Just v'' -> 
+      case valValue v'' of
+        ValIdent (IdentValStmt (stmtInstr -> GEP _
+            (Value { valType = PtrTo (Struct (Right name) _ _) })
+            [_, valValue -> ValInteger f])) -> do
+          let 
+            t = prettyIdent name
+          sfSum <- trace ("lookup sf: " ++ show (t, f)) $ lookupStructFieldSummaryList modSumm t f
+          if SFNotNull `elem` sfSum
+             then trace ("IS NOT NULL!") $ valueDereferenced i x ni
+             else pure ni
+        ValIdent (IdentValStmt (stmtInstr -> x)) -> trace ("Other instruction: " ++ show x) (pure ni)
+        ValIdent x -> trace ("Other ident: " ++ show x) (pure ni)
+        _ -> pure ni
+    _ -> pure ni
+valueStored _ _ _ ni = pure ni
+
 valueDereferenced :: Stmt -> Value -> NullInfo -> Analysis NullInfo
 valueDereferenced i ptr ni
   | Just v <- memAccessBase ptr = do
-    v' <- mustExecuteValue v
-    return $ fromMaybe ni $ do
-      v'' <- v'
-      arg <- fromValue v''
-      let w = Witness i "deref"
-      return ni { nonNullArguments = S.insert arg (nonNullArguments ni)
-                , nullWitnesses = MS.insertWith S.union arg (S.singleton w) ws
+      v' <- mustExecuteValue v
+      trace ("must execute deref: " ++ show v') $ return $ fromMaybe ni $ do
+        v'' <- v'
+        case valValue v'' of
+          ValIdent (IdentValStmt (stmtInstr -> GEP _
+            (Value { valType = PtrTo (Struct (Right name) _ _) })
+            [_, valValue -> ValInteger i])) | throughStruct ->
+              trace ("struct field deref: " ++ prettyIdent name ++ "." ++ show i) $ return ni
+                { nonNullLocations = insertNullLoc (FieldLoc (prettyIdent name) i) (nonNullLocations ni)
                 }
+          ValIdent (IdentValArgument arg) -> do
+            let w = Witness i "deref"
+            trace ("arg deref: " ++ show arg) $ return ni
+              { nonNullLocations = insertNullLoc (ArgLoc arg) (nonNullLocations ni)
+              , nullWitnesses = MS.insertWith S.union (ArgLoc arg) (S.singleton w) ws
+              }
+          _ -> Nothing
   | otherwise = return ni
   where
     ws = nullWitnesses ni
+
+
+-- TODO generalize and move this
+showStmtInstr = show . fmap stmtInstr . valueStmt . valValue
+
+valueStmt (ValIdent (IdentValStmt s)) = Just s
+valueStmt _ = Nothing
+
 
 -- | Given a value that is being dereferenced by an instruction
 -- (either a load, store, or atomic memory op), determine the *base*
@@ -370,16 +474,16 @@ callTransfer i calledFunc args ni = do
 
   let bb = stmtBasicBlock i
       f = bbDefine bb
-      formals = S.fromList $ defArgs f
+      formals = S.fromList $ map ArgLoc $ filter isPointer $ defArgs f
   -- let nullValues = nullPointersAt nullSumm i
   --     nullArgs :: Set Argument
   --     nullArgs = S.fromList $ mapMaybe fromValue nullValues
   ni' <- case FANoRet `elem` retAttrs of
-    True ->
-      return ni { nonNullArguments = formals
-                , nullWitnesses =
-                  S.foldl' (addWitness "arg/noret" i) (nullWitnesses ni) formals
-                }
+    True -> trace ("arg/noret callTransfer: " ++ show (f, formals))
+      $ return ni { nonNullLocations = NullLocsSet formals
+                  , nullWitnesses =
+                    S.foldl' (addWitness "arg/noret" i) (nullWitnesses ni) formals
+                  }
 
     False -> foldM (checkArg modSumm) ni indexedArgs
 
@@ -398,9 +502,9 @@ callTransfer i calledFunc args ni = do
 
 addWitness :: String
               -> Stmt
-              -> Map Argument (Set Witness)
-              -> Argument
-              -> Map Argument (Set Witness)
+              -> Map NullLoc (Set Witness)
+              -> NullLoc
+              -> Map NullLoc (Set Witness)
 addWitness reason i m a =
   MS.insertWith S.union a (S.singleton (Witness i reason)) m
 
@@ -479,8 +583,12 @@ nullSummaryToTestFormat :: NullableSummary -> Map String (Set String)
 nullSummaryToTestFormat (NullableSummary m _) =
   foldr addArg M.empty (HM.toList m)
   where
-    addArg (a, _) acc =
+    addArg (ArgLoc a, _) acc =
       let f = argDefine a
           k = prettySymbol (defName f)
           v = S.singleton (argName a)
+      in MS.insertWith S.union k v acc
+    addArg (FieldLoc struct field, _) acc =
+      let k = struct
+          v = S.singleton (show field)
       in MS.insertWith S.union k v acc

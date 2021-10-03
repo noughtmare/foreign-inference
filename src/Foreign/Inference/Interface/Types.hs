@@ -9,6 +9,7 @@ module Foreign.Inference.Interface.Types (
   CType(..),
   FuncAnnotation(..),
   ParamAnnotation(..),
+  StructFieldAnnotation(..),
   TypeAnnotation(..),
   ModuleAnnotation(..),
   Linkage(..),
@@ -113,13 +114,32 @@ instance A.ToJSON ParamAnnotation where
 instance NFData ParamAnnotation where
   rnf = genericRnf
 
+-- | The annotations that are specific to individual struct fields.
+--
+-- Other annotations:
+data StructFieldAnnotation = SFNotNull
+  deriving (Show, Read, Generic, Eq, Ord)
+
+instance A.FromJSON StructFieldAnnotation where
+  parseJSON v = A.withObject "Struct field annotation" parseAnnot v
+    where
+      parseAnnot o = SFNotNull <$ hasKey o "SFNotNull"
+
+instance A.ToJSON StructFieldAnnotation where
+  toJSON a =
+    case a of
+      SFNotNull -> A.object [ "SFNotNull" .= () ]
+
+instance NFData StructFieldAnnotation where
+  rnf = genericRnf
+
 instance A.FromJSON AccessType where
   parseJSON v = A.withObject "Expected access type object" parseAT v
     where
       parseAT o = AccessField <$> o .: "AccessField"
-                  <|> AccessUnion <$ hasKey o "AccessUnion"
-                  <|> AccessArray <$ hasKey o "AccessArray"
-                  <|> AccessDeref <$ hasKey o "AccessDeref"
+              <|> AccessUnion <$ hasKey o "AccessUnion"
+              <|> AccessArray <$ hasKey o "AccessArray"
+              <|> AccessDeref <$ hasKey o "AccessDeref"
 
 instance A.ToJSON AccessType where
   toJSON at =

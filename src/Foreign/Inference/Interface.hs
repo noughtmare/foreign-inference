@@ -34,6 +34,7 @@ module Foreign.Inference.Interface (
   ErrorActionArgument(..),
   ErrorReturn(..),
   ParamAnnotation(..),
+  StructFieldAnnotation(..),
   FuncAnnotation(..),
   TypeAnnotation(..),
   ModuleAnnotation(..),
@@ -41,6 +42,8 @@ module Foreign.Inference.Interface (
   -- * Functions
   lookupArgumentSummary,
   lookupArgumentSummaryList,
+  lookupStructFieldSummary,
+  lookupStructFieldSummaryList,
   lookupFunctionSummary,
   lookupFunctionSummaryList,
   loadDependencies,
@@ -234,12 +237,15 @@ class SummarizeModule s where
   summarizeType _ _ = []
   summarizeModule :: Module -> s -> [ModuleAnnotation]
   summarizeModule _ _ = []
+  summarizeStructField :: String -> Integer -> s -> [(StructFieldAnnotation, [Witness])]
+  summarizeStructField _ _ _ = []
 
 instance SummarizeModule ModuleSummary where
   summarizeArgument a (ModuleSummary s) = summarizeArgument a s
   summarizeFunction f (ModuleSummary s) = summarizeFunction f s
   summarizeType t (ModuleSummary s) = summarizeType t s
   summarizeModule m (ModuleSummary s) = summarizeModule m s
+  summarizeStructField t f (ModuleSummary s) = summarizeStructField t f s
 
 -- | Persist a 'LibraryInterface' to disk in the given @summaryDir@.
 -- It uses the name specified in the 'LibraryInterface' to choose the
@@ -579,6 +585,31 @@ lookupArgumentSummaryList :: (Show v, IsValue v,
                              -> m [ParamAnnotation]
 lookupArgumentSummaryList ms val ix =
   fromMaybe [] <$> lookupArgumentSummary ms val ix
+
+lookupStructFieldSummary :: (SummarizeModule s, HasDependencies m,
+                             MonadWriter Diagnostics m)
+                         => s
+                         -> String
+                         -> Integer
+                         -> m (Maybe [StructFieldAnnotation])
+lookupStructFieldSummary ms t s = do
+  ds <- getDependencySummary
+  let annots = summarizeStructField t s ms
+      -- uannots = userStructFieldAnnotations (manualAnnotations ds) f ix
+  return $! Just $ map fst annots
+
+-- | A variant of 'lookupStructFieldSummary' where missing summaries can
+-- be treated as simply returning no annotations.  Many analyses can
+-- do this now that the missing summary warning is sunk down to this
+-- level.
+lookupStructFieldSummaryList :: (SummarizeModule s, HasDependencies m,
+                              MonadWriter Diagnostics m)
+                             => s
+                             -> String
+                             -> Integer
+                             -> m [StructFieldAnnotation]
+lookupStructFieldSummaryList ms t s =
+  fromMaybe [] <$> lookupStructFieldSummary ms t s
 
 notAFunction :: (Show v, MonadWriter Diagnostics m) => v -> m (Maybe a)
 notAFunction _ = -- do

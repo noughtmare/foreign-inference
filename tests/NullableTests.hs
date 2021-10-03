@@ -51,4 +51,5 @@ analyzeNullable ds m =
                , identifyNullable ds nullableSummary returnSummary (errorHandlingSummary . to Just)
                ]
     analysisFunc = callGraphComposeAnalysis analyses
-    res = callGraphSCCTraversal cg analysisFunc mempty
+    -- res = callGraphSCCTraversal cg analysisFunc mempty
+    res = monolithicTraversal cg analysisFunc mempty
